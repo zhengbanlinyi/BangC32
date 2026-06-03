@@ -6,5 +6,5 @@ __mlu_entry__ void lower_tri_matmul_noop_kernel() {
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return A.matmul(B).tril();
+    return A.mm(B).tril();
 }

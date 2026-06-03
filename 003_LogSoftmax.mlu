@@ -34,9 +34,13 @@ __mlu_entry__ void logsoftmax_half_kernel(
 
     __bang_sub_scalar(nram_shift, nram_shift, row_max, cols);
     __bang_active_exphp(nram_exp, nram_shift, cols);
-    __bang_sum(nram_reduce, nram_exp, cols);
 
-    __bang_write_value(nram_reduce, 64, nram_reduce[0]);
+    float sum_total = 0.0f;
+    for (int i = 0; i < LOGSOFTMAX_COLS; ++i) {
+        sum_total += nram_exp[i];
+    }
+
+    __bang_write_value(nram_reduce, 64, sum_total);
     __bang_log2(nram_reduce, nram_reduce, 64);
     __bang_mul_scalar(nram_reduce, nram_reduce, LOGSOFTMAX_LN2, 64);
 
@@ -70,9 +74,13 @@ __mlu_entry__ void logsoftmax_float_kernel(
 
     __bang_sub_scalar(nram_shift, nram_shift, row_max, cols);
     __bang_active_exphp(nram_exp, nram_shift, cols);
-    __bang_sum(nram_reduce, nram_exp, cols);
 
-    __bang_write_value(nram_reduce, 64, nram_reduce[0]);
+    float sum_total = 0.0f;
+    for (int i = 0; i < LOGSOFTMAX_COLS; ++i) {
+        sum_total += nram_exp[i];
+    }
+
+    __bang_write_value(nram_reduce, 64, sum_total);
     __bang_log2(nram_reduce, nram_reduce, 64);
     __bang_mul_scalar(nram_reduce, nram_reduce, LOGSOFTMAX_LN2, 64);
 
