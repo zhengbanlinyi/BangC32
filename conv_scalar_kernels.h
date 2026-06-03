@@ -258,7 +258,8 @@ __mlu_entry__ void depthwise_separable2d_half_kernel(
                 }
             }
             int pointwise_offset = oc * in_channels + ic;
-            sum += depth_sum * (float)pointwise_weight[pointwise_offset];
+            half depth_half = (half)depth_sum;
+            sum += (float)depth_half * (float)pointwise_weight[pointwise_offset];
         }
 
         output[idx] = (half)sum;

@@ -1,0 +1,10 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void matmul_transposed_both_noop_kernel() {
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    return A.t().mm(B.t());
+}

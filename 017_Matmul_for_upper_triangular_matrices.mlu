@@ -1,10 +1,51 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
 
-__mlu_entry__ void upper_tri_matmul_noop_kernel() {
+#define TRI_MASK_TASKS 4096
+
+__mlu_entry__ void upper_mask_float_kernel(float *data, int n, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int row = idx / n;
+        int col = idx - row * n;
+        if (row > col) {
+            data[idx] = 0.0f;
+        }
+    }
+}
+
+__mlu_entry__ void upper_mask_half_kernel(half *data, int n, int total) {
+    half zero = (half)0.0f;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int row = idx / n;
+        int col = idx - row * n;
+        if (row > col) {
+            data[idx] = zero;
+        }
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return A.mm(B).triu();
+    auto output = A.mm(B);
+    int n = (int)output.size(0);
+    int total = (int)output.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {TRI_MASK_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (output.scalar_type() == torch::kHalf) {
+        upper_mask_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            n,
+            total);
+        return output;
+    }
+
+    upper_mask_float_kernel<<<grid, ktype, queue>>>(
+        output.data_ptr<float>(),
+        n,
+        total);
+    return output;
 }
