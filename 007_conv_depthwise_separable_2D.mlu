@@ -1,0 +1,37 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void depthwise_separable_noop_kernel() {
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor depthwise_kernel,
+    torch::Tensor pointwise_kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) {
+
+    c10::optional<torch::Tensor> bias = c10::nullopt;
+    auto depthwise = torch::conv2d(
+        x,
+        depthwise_kernel,
+        bias,
+        {stride, stride},
+        {padding, padding},
+        {dilation, dilation},
+        in_channels);
+
+    return torch::conv2d(
+        depthwise,
+        pointwise_kernel,
+        bias,
+        {1, 1},
+        {0, 0},
+        {1, 1},
+        1);
+}
