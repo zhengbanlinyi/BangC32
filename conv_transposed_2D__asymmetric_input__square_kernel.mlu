@@ -1,1 +1,484 @@
-#include "012_conv_transposed_2D__asymmetric_input__square_kernel.mlu"
+#include <cnnl.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#include <initializer_list>
+#include <vector>
+
+namespace bangc_cnnl {
+
+inline void check_cnnl(cnnlStatus_t status, const char *what) {
+    TORCH_CHECK(status == CNNL_STATUS_SUCCESS, what, " failed with CNNL status ", (int)status);
+}
+
+inline void check_cnrt(cnrtRet_t status, const char *what) {
+    TORCH_CHECK(status == CNRT_RET_SUCCESS, what, " failed with CNRT status ", (int)status);
+}
+
+inline cnnlDataType_t dtype_of(const torch::Tensor &tensor) {
+    if (tensor.scalar_type() == torch::kHalf) {
+        return CNNL_DTYPE_HALF;
+    }
+    if (tensor.scalar_type() == torch::kFloat) {
+        return CNNL_DTYPE_FLOAT;
+    }
+    TORCH_CHECK(false, "Only float16 and float32 tensors are supported");
+}
+
+struct Handle {
+    cnnlHandle_t handle = nullptr;
+
+    Handle() {
+        check_cnnl(cnnlCreate(&handle), "cnnlCreate");
+        check_cnnl(cnnlSetQueue(handle, torch_mlu::getCurMLUStream()), "cnnlSetQueue");
+    }
+
+    ~Handle() {
+        if (handle != nullptr) {
+            cnnlDestroy(handle);
+        }
+    }
+
+    operator cnnlHandle_t() const {
+        return handle;
+    }
+};
+
+struct TensorDesc {
+    cnnlTensorDescriptor_t desc = nullptr;
+
+    TensorDesc(cnnlTensorLayout_t layout, cnnlDataType_t dtype, std::initializer_list<int> dims) {
+        std::vector<int> shape(dims);
+        check_cnnl(cnnlCreateTensorDescriptor(&desc), "cnnlCreateTensorDescriptor");
+        check_cnnl(cnnlSetTensorDescriptor(desc, layout, dtype, (int)shape.size(), shape.data()),
+                   "cnnlSetTensorDescriptor");
+    }
+
+    ~TensorDesc() {
+        if (desc != nullptr) {
+            cnnlDestroyTensorDescriptor(desc);
+        }
+    }
+
+    operator cnnlTensorDescriptor_t() const {
+        return desc;
+    }
+};
+
+struct ConvDesc {
+    cnnlConvolutionDescriptor_t desc = nullptr;
+
+    ConvDesc(int pad_h,
+             int pad_w,
+             int stride_h,
+             int stride_w,
+             int dilation_h,
+             int dilation_w,
+             int groups,
+             cnnlDataType_t compute_type) {
+        int pads[4] = {pad_h, pad_h, pad_w, pad_w};
+        int strides[2] = {stride_h, stride_w};
+        int dilations[2] = {dilation_h, dilation_w};
+        check_cnnl(cnnlCreateConvolutionDescriptor(&desc), "cnnlCreateConvolutionDescriptor");
+        check_cnnl(cnnlSetConvolutionDescriptor(desc, 4, pads, strides, dilations, groups, compute_type),
+                   "cnnlSetConvolutionDescriptor");
+    }
+
+    ~ConvDesc() {
+        if (desc != nullptr) {
+            cnnlDestroyConvolutionDescriptor(desc);
+        }
+    }
+
+    operator cnnlConvolutionDescriptor_t() const {
+        return desc;
+    }
+};
+
+struct PoolDesc {
+    cnnlPoolingDescriptor_t desc = nullptr;
+
+    PoolDesc(int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
+        check_cnnl(cnnlCreatePoolingDescriptor(&desc), "cnnlCreatePoolingDescriptor");
+        check_cnnl(cnnlSetPooling2dDescriptor_v2(desc,
+                                                 CNNL_POOLING_AVERAGE_COUNT_INCLUDE_PADDING,
+                                                 CNNL_NOT_PROPAGATE_NAN,
+                                                 kernel_h,
+                                                 kernel_w,
+                                                 pad_h,
+                                                 pad_h,
+                                                 pad_w,
+                                                 pad_w,
+                                                 stride_h,
+                                                 stride_w,
+                                                 1,
+                                                 1,
+                                                 false),
+                   "cnnlSetPooling2dDescriptor_v2");
+    }
+
+    ~PoolDesc() {
+        if (desc != nullptr) {
+            cnnlDestroyPoolingDescriptor(desc);
+        }
+    }
+
+    operator cnnlPoolingDescriptor_t() const {
+        return desc;
+    }
+};
+
+struct Workspace {
+    void *ptr = nullptr;
+    size_t size = 0;
+
+    explicit Workspace(size_t bytes) : size(bytes) {
+        if (size > 0) {
+            check_cnrt(cnrtMalloc(&ptr, size), "cnrtMalloc");
+        }
+    }
+
+    ~Workspace() {
+        if (ptr != nullptr) {
+            cnrtFree(ptr);
+        }
+    }
+};
+
+inline torch::Tensor avg_pool2d(torch::Tensor x, int kernel_size) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "average_pooling_2d expects NCHW input");
+
+    const int n = (int)x.size(0);
+    const int c = (int)x.size(1);
+    const int h = (int)x.size(2);
+    const int w = (int)x.size(3);
+    const int out_h = (h - kernel_size) / kernel_size + 1;
+    const int out_w = (w - kernel_size) / kernel_size + 1;
+
+    auto output = torch::empty({n, c, out_h, out_w}, x.options());
+    Handle handle;
+    TensorDesc x_desc(CNNL_LAYOUT_NCHW, dtype_of(x), {1, c, h, w});
+    TensorDesc y_desc(CNNL_LAYOUT_NCHW, dtype_of(output), {1, c, out_h, out_w});
+    PoolDesc pool_desc(kernel_size, kernel_size, kernel_size, kernel_size, 0, 0);
+
+    size_t workspace_size = 0;
+    check_cnnl(cnnlGetPoolingWorkspaceSize_v2(handle,
+                                              pool_desc,
+                                              x_desc,
+                                              y_desc,
+                                              &workspace_size),
+               "cnnlGetPoolingWorkspaceSize_v2");
+    Workspace workspace(workspace_size);
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    const int64_t input_batch_bytes = (int64_t)c * h * w * x.element_size();
+    const int64_t output_batch_bytes = (int64_t)c * out_h * out_w * output.element_size();
+    const char *x_base = reinterpret_cast<const char *>(x.data_ptr());
+    char *y_base = reinterpret_cast<char *>(output.data_ptr());
+    for (int i = 0; i < n; ++i) {
+        check_cnnl(cnnlPoolingForward_v2(handle,
+                                         pool_desc,
+                                         &alpha,
+                                         x_desc,
+                                         x_base + i * input_batch_bytes,
+                                         &beta,
+                                         nullptr,
+                                         y_desc,
+                                         y_base + i * output_batch_bytes,
+                                         workspace.ptr,
+                                         workspace.size),
+                   "cnnlPoolingForward_v2");
+    }
+    return output;
+}
+
+inline torch::Tensor conv2d_forward(torch::Tensor x,
+                                    torch::Tensor weight,
+                                    int out_channels,
+                                    int kernel_h,
+                                    int kernel_w,
+                                    int stride_h,
+                                    int stride_w,
+                                    int pad_h,
+                                    int pad_w,
+                                    int dilation_h,
+                                    int dilation_w,
+                                    int groups,
+                                    int out_h,
+                                    int out_w) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "conv2d_forward expects NCHW input");
+
+    auto x_f = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto w_f = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+
+    const int n = (int)x_f.size(0);
+    const int in_channels = (int)x_f.size(1);
+    const int h = (int)x_f.size(2);
+    const int w = (int)x_f.size(3);
+
+    auto x_nhwc = x_f.permute({0, 2, 3, 1}).contiguous();
+    const bool depthwise = (groups == in_channels && out_channels == in_channels);
+    auto w_layout = depthwise ? CNNL_LAYOUT_HWCN : CNNL_LAYOUT_NHWC;
+    auto w_data = depthwise ? w_f.permute({2, 3, 1, 0}).contiguous()
+                            : w_f.permute({0, 2, 3, 1}).contiguous();
+    auto y_nhwc = torch::empty({n, out_h, out_w, out_channels}, x.options().dtype(torch::kFloat));
+    Handle handle;
+    TensorDesc x_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, h, w, in_channels});
+    TensorDesc w_desc(w_layout,
+                      CNNL_DTYPE_FLOAT,
+                      depthwise ? std::initializer_list<int>{kernel_h, kernel_w, in_channels / groups, out_channels}
+                                : std::initializer_list<int>{out_channels, kernel_h, kernel_w, in_channels / groups});
+    TensorDesc y_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, out_h, out_w, out_channels});
+    ConvDesc conv_desc(pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, groups, CNNL_DTYPE_FLOAT);
+
+    cnnlConvolutionForwardAlgo_t algo = CNNL_CONVOLUTION_FWD_ALGO_DIRECT;
+    size_t workspace_size = 0;
+    check_cnnl(cnnlGetConvolutionForwardWorkspaceSize(handle,
+                                                       x_desc,
+                                                       w_desc,
+                                                       y_desc,
+                                                       nullptr,
+                                                       conv_desc,
+                                                       algo,
+                                                       &workspace_size),
+               "cnnlGetConvolutionForwardWorkspaceSize");
+    Workspace workspace(workspace_size);
+    check_cnnl(cnnlConvolutionForward(handle,
+                                      conv_desc,
+                                      algo,
+                                      nullptr,
+                                      x_desc,
+                                      x_nhwc.data_ptr(),
+                                      w_desc,
+                                      w_data.data_ptr(),
+                                      nullptr,
+                                      nullptr,
+                                      workspace.ptr,
+                                      workspace.size,
+                                      nullptr,
+                                      y_desc,
+                                      y_nhwc.data_ptr()),
+               "cnnlConvolutionForward");
+    return y_nhwc.permute({0, 3, 1, 2}).contiguous();
+}
+
+inline torch::Tensor conv1d_forward(torch::Tensor x,
+                                    torch::Tensor weight,
+                                    int in_channels,
+                                    int out_channels,
+                                    int kernel_size,
+                                    int stride,
+                                    int padding,
+                                    int dilation,
+                                    int groups) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "conv1d_forward expects NCL input");
+
+    auto x_f = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto w_f = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+
+    const int n = (int)x_f.size(0);
+    const int length = (int)x_f.size(2);
+    const int out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    auto x_nhwc = x_f.reshape({n, in_channels, 1, length}).permute({0, 2, 3, 1}).contiguous();
+    auto w_nhwc = w_f.reshape({out_channels, in_channels / groups, 1, kernel_size})
+                      .permute({0, 2, 3, 1})
+                      .contiguous();
+    auto y_nhwc = torch::empty({n, 1, out_length, out_channels}, x.options().dtype(torch::kFloat));
+    Handle handle;
+    TensorDesc x_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, 1, length, in_channels});
+    TensorDesc w_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {out_channels, 1, kernel_size, in_channels / groups});
+    TensorDesc y_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, 1, out_length, out_channels});
+    ConvDesc conv_desc(0, padding, 1, stride, 1, dilation, groups, CNNL_DTYPE_FLOAT);
+
+    cnnlConvolutionForwardAlgo_t algo = CNNL_CONVOLUTION_FWD_ALGO_DIRECT;
+    size_t workspace_size = 0;
+    check_cnnl(cnnlGetConvolutionForwardWorkspaceSize(handle,
+                                                       x_desc,
+                                                       w_desc,
+                                                       y_desc,
+                                                       nullptr,
+                                                       conv_desc,
+                                                       algo,
+                                                       &workspace_size),
+               "cnnlGetConvolutionForwardWorkspaceSize");
+    Workspace workspace(workspace_size);
+    check_cnnl(cnnlConvolutionForward(handle,
+                                      conv_desc,
+                                      algo,
+                                      nullptr,
+                                      x_desc,
+                                      x_nhwc.data_ptr(),
+                                      w_desc,
+                                      w_nhwc.data_ptr(),
+                                      nullptr,
+                                      nullptr,
+                                      workspace.ptr,
+                                      workspace.size,
+                                      nullptr,
+                                      y_desc,
+                                      y_nhwc.data_ptr()),
+               "cnnlConvolutionForward");
+    return y_nhwc.permute({0, 3, 1, 2}).contiguous().reshape({n, out_channels, out_length});
+}
+
+inline torch::Tensor conv_transpose2d(torch::Tensor x,
+                                      torch::Tensor weight,
+                                      int in_channels,
+                                      int out_channels,
+                                      int kernel_h,
+                                      int kernel_w,
+                                      int stride_h,
+                                      int stride_w,
+                                      int pad_h,
+                                      int pad_w,
+                                      int output_padding_h,
+                                      int output_padding_w,
+                                      int groups,
+                                      int out_h,
+                                      int out_w) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "conv_transpose2d expects NCHW input");
+
+    auto x_f = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto w_f = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+
+    (void)output_padding_h;
+    (void)output_padding_w;
+    const int n = (int)x_f.size(0);
+    const int h = (int)x_f.size(2);
+    const int w = (int)x_f.size(3);
+
+    auto dy_nhwc = x_f.permute({0, 2, 3, 1}).contiguous();
+    auto filter_hwcn = w_f.permute({2, 3, 1, 0}).contiguous();
+    auto dx_nhwc = torch::empty({n, out_h, out_w, out_channels}, x.options().dtype(torch::kFloat));
+    Handle handle;
+    TensorDesc filter_desc(CNNL_LAYOUT_HWCN,
+                           CNNL_DTYPE_FLOAT,
+                           {kernel_h, kernel_w, out_channels / groups, in_channels});
+    TensorDesc dy_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, h, w, in_channels});
+    TensorDesc dx_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, out_h, out_w, out_channels});
+    ConvDesc conv_desc(pad_h, pad_w, stride_h, stride_w, 1, 1, groups, CNNL_DTYPE_FLOAT);
+
+    cnnlConvolutionBwdDataAlgo_t algo = CNNL_CONVOLUTION_BWD_DATA_ALGO_DIRECT;
+    size_t workspace_size = 0;
+    check_cnnl(cnnlGetConvolutionBackwardDataWorkspaceSize(handle,
+                                                           filter_desc,
+                                                           dy_desc,
+                                                           conv_desc,
+                                                           dx_desc,
+                                                           algo,
+                                                           &workspace_size),
+               "cnnlGetConvolutionBackwardDataWorkspaceSize");
+    Workspace workspace(workspace_size);
+    check_cnnl(cnnlConvolutionBackwardData(handle,
+                                           nullptr,
+                                           filter_desc,
+                                           filter_hwcn.data_ptr(),
+                                           dy_desc,
+                                           dy_nhwc.data_ptr(),
+                                           conv_desc,
+                                           algo,
+                                           workspace.ptr,
+                                           workspace.size,
+                                           nullptr,
+                                           dx_desc,
+                                           dx_nhwc.data_ptr()),
+               "cnnlConvolutionBackwardData");
+    return dx_nhwc.permute({0, 3, 1, 2}).contiguous();
+}
+
+inline torch::Tensor conv_transpose1d(torch::Tensor x,
+                                      torch::Tensor weight,
+                                      int in_channels,
+                                      int out_channels,
+                                      int kernel_size,
+                                      int stride,
+                                      int padding,
+                                      int output_padding,
+                                      int groups) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "conv_transpose1d expects NCL input");
+
+    auto x_f = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto w_f = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+
+    const int n = (int)x_f.size(0);
+    const int length = (int)x_f.size(2);
+    const int out_length = (length - 1) * stride - 2 * padding + kernel_size + output_padding;
+
+    auto dy_nhwc = x_f.reshape({n, in_channels, 1, length}).permute({0, 2, 3, 1}).contiguous();
+    auto filter_hwcn = w_f.reshape({in_channels, out_channels / groups, 1, kernel_size})
+                           .permute({2, 3, 1, 0})
+                           .contiguous();
+    auto dx_nhwc = torch::empty({n, 1, out_length, out_channels}, x.options().dtype(torch::kFloat));
+    Handle handle;
+    TensorDesc filter_desc(CNNL_LAYOUT_HWCN,
+                           CNNL_DTYPE_FLOAT,
+                           {1, kernel_size, out_channels / groups, in_channels});
+    TensorDesc dy_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, 1, length, in_channels});
+    TensorDesc dx_desc(CNNL_LAYOUT_NHWC, CNNL_DTYPE_FLOAT, {n, 1, out_length, out_channels});
+    ConvDesc conv_desc(0, padding, 1, stride, 1, 1, groups, CNNL_DTYPE_FLOAT);
+
+    cnnlConvolutionBwdDataAlgo_t algo = CNNL_CONVOLUTION_BWD_DATA_ALGO_DIRECT;
+    size_t workspace_size = 0;
+    check_cnnl(cnnlGetConvolutionBackwardDataWorkspaceSize(handle,
+                                                           filter_desc,
+                                                           dy_desc,
+                                                           conv_desc,
+                                                           dx_desc,
+                                                           algo,
+                                                           &workspace_size),
+               "cnnlGetConvolutionBackwardDataWorkspaceSize");
+    Workspace workspace(workspace_size);
+    check_cnnl(cnnlConvolutionBackwardData(handle,
+                                           nullptr,
+                                           filter_desc,
+                                           filter_hwcn.data_ptr(),
+                                           dy_desc,
+                                           dy_nhwc.data_ptr(),
+                                           conv_desc,
+                                           algo,
+                                           workspace.ptr,
+                                           workspace.size,
+                                           nullptr,
+                                           dx_desc,
+                                           dx_nhwc.data_ptr()),
+               "cnnlConvolutionBackwardData");
+    return dx_nhwc.permute({0, 3, 1, 2}).contiguous().reshape({n, out_channels, out_length});
+}
+
+}  // namespace bangc_cnnl
+
+#include <torch/extension.h>
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    bool bias) {
+
+    (void)in_channels;
+    (void)bias;
+    int h = (int)x.size(2);
+    int w = (int)x.size(3);
+    int out_h = (h - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int out_w = (w - 1) * stride - 2 * padding + kernel_size + output_padding;
+    return bangc_cnnl::conv_transpose2d(
+        x, kernel, in_channels, out_channels, kernel_size, kernel_size, stride, stride, padding, padding, output_padding, output_padding, groups, out_h, out_w);
+}

@@ -1,1 +1,85 @@
-#include "005_average_pooling_2d.mlu"
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define AVGPOOL_TASKS 4096
+#define AVGPOOL_OUTPUTS_PER_LAUNCH 262144
+
+__mlu_entry__ void avgpool2d_half_kernel(
+    const half *input,
+    half *output,
+    int64_t start_idx,
+    int64_t work_items,
+    int channels,
+    int height,
+    int width,
+    int out_h,
+    int out_w,
+    int kernel_size) {
+
+    float inv_area = 1.0f / (float)(kernel_size * kernel_size);
+
+    for (int64_t local_idx = taskId; local_idx < work_items; local_idx += taskDim) {
+        int64_t idx = start_idx + local_idx;
+        int ow = (int)(idx % out_w);
+        int64_t t = idx / out_w;
+        int oh = (int)(t % out_h);
+        t /= out_h;
+        int c = (int)(t % channels);
+        int64_t n = t / channels;
+
+        int ih0 = oh * kernel_size;
+        int iw0 = ow * kernel_size;
+        int64_t base = (((n * channels + c) * (int64_t)height + ih0) * width + iw0);
+        float sum = 0.0f;
+
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            int64_t row = base + (int64_t)kh * width;
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                sum += (float)input[row + kw];
+            }
+        }
+
+        output[idx] = (half)(sum * inv_area);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "average_pooling_2d expects NCHW input");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "average_pooling_2d expects float16 input");
+
+    int n = (int)x.size(0);
+    int c = (int)x.size(1);
+    int h = (int)x.size(2);
+    int w = (int)x.size(3);
+    int out_h = h / kernel_size;
+    int out_w = w / kernel_size;
+    int64_t total = (int64_t)n * c * out_h * out_w;
+
+    auto output = torch::empty({n, c, out_h, out_w}, x.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {AVGPOOL_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    for (int64_t start = 0; start < total; start += AVGPOOL_OUTPUTS_PER_LAUNCH) {
+        int64_t work_items = total - start;
+        if (work_items > AVGPOOL_OUTPUTS_PER_LAUNCH) {
+            work_items = AVGPOOL_OUTPUTS_PER_LAUNCH;
+        }
+        avgpool2d_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            start,
+            work_items,
+            c,
+            h,
+            w,
+            out_h,
+            out_w,
+            kernel_size);
+    }
+
+    return output;
+}
