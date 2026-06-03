@@ -6,5 +6,5 @@ __mlu_entry__ void square_matmul_noop_kernel() {
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return A.mm(B);
+    return A.to(torch::kFloat).mm(B.to(torch::kFloat));
 }

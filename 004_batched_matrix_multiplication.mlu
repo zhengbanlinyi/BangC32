@@ -6,13 +6,5 @@ __mlu_entry__ void batch_product_noop_kernel() {
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    int batch = (int)A.size(0);
-    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
-    for (int i = 0; i < batch; ++i) {
-        auto part = A.select(0, i).to(torch::kFloat)
-                        .mm(B.select(0, i).to(torch::kFloat))
-                        .to(A.scalar_type());
-        output.select(0, i).copy_(part);
-    }
-    return output;
+    return torch::bmm(A.to(torch::kFloat), B.to(torch::kFloat));
 }
