@@ -103,18 +103,21 @@ struct PoolDesc {
 
     PoolDesc(int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
         check_cnnl(cnnlCreatePoolingDescriptor(&desc), "cnnlCreatePoolingDescriptor");
-        check_cnnl(cnnlSetPooling2dDescriptor(desc,
-                                              CNNL_POOLING_AVERAGE_COUNT_INCLUDE_PADDING,
-                                              CNNL_NOT_PROPAGATE_NAN,
-                                              kernel_h,
-                                              kernel_w,
-                                              pad_h,
-                                              pad_h,
-                                              pad_w,
-                                              pad_w,
-                                              stride_h,
-                                              stride_w),
-                   "cnnlSetPooling2dDescriptor");
+        check_cnnl(cnnlSetPooling2dDescriptor_v2(desc,
+                                                 CNNL_POOLING_AVERAGE_COUNT_INCLUDE_PADDING,
+                                                 CNNL_NOT_PROPAGATE_NAN,
+                                                 kernel_h,
+                                                 kernel_w,
+                                                 pad_h,
+                                                 pad_h,
+                                                 pad_w,
+                                                 pad_w,
+                                                 stride_h,
+                                                 stride_w,
+                                                 1,
+                                                 1,
+                                                 false),
+                   "cnnlSetPooling2dDescriptor_v2");
     }
 
     ~PoolDesc() {
@@ -163,12 +166,12 @@ inline torch::Tensor avg_pool2d(torch::Tensor x, int kernel_size) {
     PoolDesc pool_desc(kernel_size, kernel_size, kernel_size, kernel_size, 0, 0);
 
     size_t workspace_size = 0;
-    check_cnnl(cnnlGetPoolingWorkspaceSize(handle,
-                                           CNNL_POOLING_AVERAGE_COUNT_INCLUDE_PADDING,
-                                           out_w,
-                                           out_h,
-                                           &workspace_size),
-               "cnnlGetPoolingWorkspaceSize");
+    check_cnnl(cnnlGetPoolingWorkspaceSize_v2(handle,
+                                              pool_desc,
+                                              x_desc,
+                                              y_desc,
+                                              &workspace_size),
+               "cnnlGetPoolingWorkspaceSize_v2");
     Workspace workspace(workspace_size);
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -177,17 +180,18 @@ inline torch::Tensor avg_pool2d(torch::Tensor x, int kernel_size) {
     const char *x_base = reinterpret_cast<const char *>(x.data_ptr());
     char *y_base = reinterpret_cast<char *>(output.data_ptr());
     for (int i = 0; i < n; ++i) {
-        check_cnnl(cnnlPoolingForward(handle,
-                                      pool_desc,
-                                      &alpha,
-                                      x_desc,
-                                      x_base + i * input_batch_bytes,
-                                      &beta,
-                                      y_desc,
-                                      y_base + i * output_batch_bytes,
-                                      workspace.ptr,
-                                      workspace.size),
-                   "cnnlPoolingForward");
+        check_cnnl(cnnlPoolingForward_v2(handle,
+                                         pool_desc,
+                                         &alpha,
+                                         x_desc,
+                                         x_base + i * input_batch_bytes,
+                                         &beta,
+                                         nullptr,
+                                         y_desc,
+                                         y_base + i * output_batch_bytes,
+                                         workspace.ptr,
+                                         workspace.size),
+                   "cnnlPoolingForward_v2");
     }
     return output;
 }
