@@ -1,0 +1,29 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void conv1d_noop_kernel() {
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    int groups,
+    int bias) {
+
+    c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
+    return torch::conv1d(
+        x,
+        kernel,
+        bias_tensor,
+        {stride},
+        {padding},
+        {dilation},
+        groups);
+}
