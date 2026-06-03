@@ -1,6 +1,7 @@
+#include <bang.h>
 #include <torch/extension.h>
-
-#include "cnnl_ops.h"
+#include <cnrt.h>
+#include "conv_scalar_kernels.h"
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -14,12 +15,54 @@ torch::Tensor bang_func(
     int groups,
     bool bias) {
 
-    (void)in_channels;
-    (void)bias;
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+
+    int n = (int)x.size(0);
     int h = (int)x.size(2);
     int w = (int)x.size(3);
     int out_h = (h - 1) * stride - 2 * padding + kernel_size + output_padding;
     int out_w = (w - 1) * stride - 2 * padding + kernel_size + output_padding;
-    return bangc_cnnl::conv_transpose2d(
-        x, kernel, in_channels, out_channels, kernel_size, kernel_size, stride, stride, padding, padding, output_padding, output_padding, groups, out_h, out_w);
+    int total = n * out_channels * out_h * out_w;
+    auto output = torch::empty({n, out_channels, out_h, out_w}, x.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {CONV_SCALAR_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (x.scalar_type() == torch::kHalf) {
+        conv_transpose2d_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(kernel.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            total,
+            in_channels,
+            out_channels,
+            h,
+            w,
+            out_h,
+            out_w,
+            kernel_size,
+            stride,
+            padding,
+            groups);
+        return output;
+    }
+
+    conv_transpose2d_float_kernel<<<grid, ktype, queue>>>(
+        x.data_ptr<float>(),
+        kernel.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total,
+        in_channels,
+        out_channels,
+        h,
+        w,
+        out_h,
+        out_w,
+        kernel_size,
+        stride,
+        padding,
+        groups);
+    return output;
 }

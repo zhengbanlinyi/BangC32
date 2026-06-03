@@ -1,6 +1,7 @@
+#include <bang.h>
 #include <torch/extension.h>
-
-#include "cnnl_ops.h"
+#include <cnrt.h>
+#include "conv_scalar_kernels.h"
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -14,7 +15,48 @@ torch::Tensor bang_func(
     int groups,
     bool bias) {
 
-    (void)in_channels;
-    (void)bias;
-    return bangc_cnnl::conv_transpose1d(x, kernel, in_channels, out_channels, kernel_size, stride, padding, output_padding, groups);
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+
+    int n = (int)x.size(0);
+    int length = (int)x.size(2);
+    int out_length = (length - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int total = n * out_channels * out_length;
+    auto output = torch::empty({n, out_channels, out_length}, x.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {CONV_SCALAR_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (x.scalar_type() == torch::kHalf) {
+        conv_transpose1d_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(kernel.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            total,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            groups);
+        return output;
+    }
+
+    conv_transpose1d_float_kernel<<<grid, ktype, queue>>>(
+        x.data_ptr<float>(),
+        kernel.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total,
+        in_channels,
+        out_channels,
+        length,
+        out_length,
+        kernel_size,
+        stride,
+        padding,
+        groups);
+    return output;
 }
