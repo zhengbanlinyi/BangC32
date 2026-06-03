@@ -1,10 +1,1 @@
-#include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
-
-__mlu_entry__ void batch_product_noop_kernel() {
-}
-
-torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return torch::bmm(A.to(torch::kFloat), B.to(torch::kFloat));
-}
+#include "004_batched_matrix_multiplication.mlu"

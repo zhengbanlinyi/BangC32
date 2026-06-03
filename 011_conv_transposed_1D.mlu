@@ -1,6 +1,6 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
+
+#include "cnnl_ops.h"
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -14,13 +14,7 @@ torch::Tensor bang_func(
     int groups,
     bool bias) {
 
-    return torch::conv_transpose1d(
-        x.to(torch::kFloat),
-        kernel.to(torch::kFloat),
-        {},
-        {stride},
-        {padding},
-        {output_padding},
-        groups,
-        {1});
+    (void)in_channels;
+    (void)bias;
+    return bangc_cnnl::conv_transpose1d(x, kernel, in_channels, out_channels, kernel_size, stride, padding, output_padding, groups);
 }

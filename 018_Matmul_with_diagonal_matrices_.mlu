@@ -1,10 +1,64 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
 
-__mlu_entry__ void diagonal_matmul_noop_kernel() {
+#define DIAG_MUL_TASKS 4096
+
+__mlu_entry__ void diag_mul_half_kernel(
+    const half *diag,
+    const half *matrix,
+    float *output,
+    int total,
+    int cols) {
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int row = idx / cols;
+        output[idx] = (float)diag[row] * (float)matrix[idx];
+    }
+}
+
+__mlu_entry__ void diag_mul_float_kernel(
+    const float *diag,
+    const float *matrix,
+    float *output,
+    int total,
+    int cols) {
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int row = idx / cols;
+        output[idx] = diag[row] * matrix[idx];
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return A.unsqueeze(1) * B;
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+
+    int rows = (int)B.size(0);
+    int cols = (int)B.size(1);
+    int total = rows * cols;
+    auto output = torch::empty({rows, cols}, B.options().dtype(torch::kFloat));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {DIAG_MUL_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (B.scalar_type() == torch::kHalf) {
+        diag_mul_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(A.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(B.data_ptr<at::Half>()),
+            output.data_ptr<float>(),
+            total,
+            cols);
+        return output;
+    }
+
+    diag_mul_float_kernel<<<grid, ktype, queue>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total,
+        cols);
+    return output;
 }

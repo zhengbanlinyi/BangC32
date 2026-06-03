@@ -1,0 +1,105 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define POINTWISE_CHUNK 16384
+#define POINTWISE_TASKS 16
+#define LN2_F 0.6931471805599453f
+
+__mlu_entry__ void softplus_float_kernel(
+    const float *input,
+    float *output,
+    int per_task,
+    int remainder) {
+
+    uint32_t task_id = taskId;
+    uint32_t start = task_id * per_task +
+                     (task_id < (uint32_t)remainder ? task_id : (uint32_t)remainder);
+    uint32_t count = per_task +
+                     (task_id < (uint32_t)remainder ? 1 : 0);
+
+    __nram__ float nram_x[POINTWISE_CHUNK];
+    __nram__ float nram_y[POINTWISE_CHUNK];
+
+    for (uint32_t offset = 0; offset < count; offset += POINTWISE_CHUNK) {
+        uint32_t len = (offset + POINTWISE_CHUNK <= count)
+                           ? POINTWISE_CHUNK
+                           : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_x, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+        __bang_active_exphp(nram_y, nram_x, aligned_len);
+        __bang_add_scalar(nram_y, nram_y, 1.0f, aligned_len);
+        __bang_log2(nram_y, nram_y, aligned_len);
+        __bang_mul_scalar(nram_y, nram_y, LN2_F, aligned_len);
+        __memcpy(output + start + offset, nram_y, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+__mlu_entry__ void softplus_half_kernel(
+    const half *input,
+    half *output,
+    int per_task,
+    int remainder) {
+
+    uint32_t task_id = taskId;
+    uint32_t start = task_id * per_task +
+                     (task_id < (uint32_t)remainder ? task_id : (uint32_t)remainder);
+    uint32_t count = per_task +
+                     (task_id < (uint32_t)remainder ? 1 : 0);
+
+    __nram__ half nram_half[POINTWISE_CHUNK];
+    __nram__ float nram_x[POINTWISE_CHUNK];
+    __nram__ float nram_y[POINTWISE_CHUNK];
+
+    for (uint32_t offset = 0; offset < count; offset += POINTWISE_CHUNK) {
+        uint32_t len = (offset + POINTWISE_CHUNK <= count)
+                           ? POINTWISE_CHUNK
+                           : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_half, input + start + offset, len * sizeof(half), GDRAM2NRAM);
+        __bang_half2float(nram_x, nram_half, aligned_len);
+        __bang_active_exphp(nram_y, nram_x, aligned_len);
+        __bang_add_scalar(nram_y, nram_y, 1.0f, aligned_len);
+        __bang_log2(nram_y, nram_y, aligned_len);
+        __bang_mul_scalar(nram_y, nram_y, LN2_F, aligned_len);
+        __bang_float2half_rd(nram_half, nram_y, aligned_len);
+        __memcpy(output + start + offset, nram_half, len * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+static inline void split_work(int total, int *per_task, int *remainder) {
+    *per_task = total / POINTWISE_TASKS;
+    *remainder = total - (*per_task) * POINTWISE_TASKS;
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto output = torch::empty_like(x);
+    int per_task = 0;
+    int remainder = 0;
+    split_work((int)x.numel(), &per_task, &remainder);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {POINTWISE_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    if (x.scalar_type() == torch::kHalf) {
+        softplus_half_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            per_task,
+            remainder);
+        return output;
+    }
+
+    softplus_float_kernel<<<dim, ktype, queue>>>(
+        x.data_ptr<float>(),
+        output.data_ptr<float>(),
+        per_task,
+        remainder);
+    return output;
+}

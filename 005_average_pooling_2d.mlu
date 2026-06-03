@@ -1,19 +1,7 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
-#include <vector>
+
+#include "cnnl_ops.h"
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
-    std::vector<torch::Tensor> outputs;
-    outputs.reserve(x.size(0));
-    for (int64_t n = 0; n < x.size(0); ++n) {
-        outputs.push_back(torch::avg_pool2d(
-            x.narrow(0, n, 1),
-            {kernel_size, kernel_size},
-            {kernel_size, kernel_size},
-            {0, 0},
-            false,
-            true));
-    }
-    return torch::cat(outputs, 0);
+    return bangc_cnnl::avg_pool2d(x, kernel_size);
 }
