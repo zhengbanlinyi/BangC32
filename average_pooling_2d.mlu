@@ -1,125 +1,19 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <stdint.h>
-
-#define AVGPOOL_TASKS 4096
-
-__mlu_entry__ void avgpool2d_half_kernel(
-    const half *input,
-    half *output,
-    int total,
-    int channels,
-    int height,
-    int width,
-    int out_h,
-    int out_w,
-    int kernel_size) {
-
-    int area = kernel_size * kernel_size;
-    float inv_area = 1.0f / (float)area;
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int ow = idx % out_w;
-        int t = idx / out_w;
-        int oh = t % out_h;
-        t /= out_h;
-        int c = t % channels;
-        int n = t / channels;
-
-        int ih0 = oh * kernel_size;
-        int iw0 = ow * kernel_size;
-        int base = ((n * channels + c) * height + ih0) * width + iw0;
-        float sum = 0.0f;
-
-        for (int kh = 0; kh < kernel_size; ++kh) {
-            int row = base + kh * width;
-            for (int kw = 0; kw < kernel_size; ++kw) {
-                sum += (float)input[row + kw];
-            }
-        }
-
-        output[idx] = (half)(sum * inv_area);
-    }
-}
-
-__mlu_entry__ void avgpool2d_float_kernel(
-    const float *input,
-    float *output,
-    int total,
-    int channels,
-    int height,
-    int width,
-    int out_h,
-    int out_w,
-    int kernel_size) {
-
-    int area = kernel_size * kernel_size;
-    float inv_area = 1.0f / (float)area;
-
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int ow = idx % out_w;
-        int t = idx / out_w;
-        int oh = t % out_h;
-        t /= out_h;
-        int c = t % channels;
-        int n = t / channels;
-
-        int ih0 = oh * kernel_size;
-        int iw0 = ow * kernel_size;
-        int base = ((n * channels + c) * height + ih0) * width + iw0;
-        float sum = 0.0f;
-
-        for (int kh = 0; kh < kernel_size; ++kh) {
-            int row = base + kh * width;
-            for (int kw = 0; kw < kernel_size; ++kw) {
-                sum += input[row + kw];
-            }
-        }
-
-        output[idx] = sum * inv_area;
-    }
-}
+#include <vector>
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(x.dim() == 4, "average_pooling_2d expects NCHW input");
-
-    int n = (int)x.size(0);
-    int c = (int)x.size(1);
-    int h = (int)x.size(2);
-    int w = (int)x.size(3);
-    int out_h = h / kernel_size;
-    int out_w = w / kernel_size;
-    int total = n * c * out_h * out_w;
-
-    auto output = torch::empty({n, c, out_h, out_w}, x.options());
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {AVGPOOL_TASKS, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-
-    if (x.scalar_type() == torch::kHalf) {
-        avgpool2d_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-            total,
-            c,
-            h,
-            w,
-            out_h,
-            out_w,
-            kernel_size);
-        return output;
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(x.size(0));
+    for (int64_t n = 0; n < x.size(0); ++n) {
+        outputs.push_back(torch::avg_pool2d(
+            x.narrow(0, n, 1),
+            {kernel_size, kernel_size},
+            {kernel_size, kernel_size},
+            {0, 0},
+            false,
+            true));
     }
-
-    avgpool2d_float_kernel<<<grid, ktype, queue>>>(
-        x.data_ptr<float>(),
-        output.data_ptr<float>(),
-        total,
-        c,
-        h,
-        w,
-        out_h,
-        out_w,
-        kernel_size);
-    return output;
+    return torch::cat(outputs, 0);
 }
