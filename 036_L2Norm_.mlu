@@ -1,0 +1,65 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <math.h>
+
+#define NORM_B 16
+#define NORM_D 16384
+
+__mlu_entry__ void l2norm_half_kernel(const half *input, half *output) {
+    int row = taskId;
+    if (row >= NORM_B) {
+        return;
+    }
+    __nram__ half nram_half[NORM_D];
+    __nram__ float nram_x[NORM_D];
+    __nram__ float nram_sq[NORM_D];
+    int base = row * NORM_D;
+
+    __memcpy(nram_half, input + base, NORM_D * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_half, NORM_D);
+    __bang_mul(nram_sq, nram_x, nram_x, NORM_D);
+    float sum = __bang_sum(nram_sq, NORM_D);
+    float inv = 1.0f / sqrtf(sum);
+    __bang_mul_scalar(nram_x, nram_x, inv, NORM_D);
+    __bang_float2half_rd(nram_half, nram_x, NORM_D);
+    __memcpy(output + base, nram_half, NORM_D * sizeof(half), NRAM2GDRAM);
+}
+
+__mlu_entry__ void l2norm_float_kernel(const float *input, float *output) {
+    int row = taskId;
+    if (row >= NORM_B) {
+        return;
+    }
+    __nram__ float nram_x[NORM_D];
+    __nram__ float nram_sq[NORM_D];
+    int base = row * NORM_D;
+
+    __memcpy(nram_x, input + base, NORM_D * sizeof(float), GDRAM2NRAM);
+    __bang_mul(nram_sq, nram_x, nram_x, NORM_D);
+    float sum = __bang_sum(nram_sq, NORM_D);
+    float inv = 1.0f / sqrtf(sum);
+    __bang_mul_scalar(nram_x, nram_x, inv, NORM_D);
+    __memcpy(output + base, nram_x, NORM_D * sizeof(float), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == NORM_D, "Only shape [16, 16384] is supported");
+
+    auto output = torch::empty_like(x);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {NORM_B, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (x.scalar_type() == torch::kHalf) {
+        l2norm_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        return output;
+    }
+
+    l2norm_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>());
+    return output;
+}

@@ -3,7 +3,7 @@
 #include <cnrt.h>
 #include <stdint.h>
 
-#define LEAKY_CHUNK 16384
+#define LEAKY_CHUNK 4096
 #define LEAKY_TASKS 512
 
 __mlu_entry__ void leakyrelu_float_kernel(
