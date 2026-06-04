@@ -1,0 +1,56 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void prefix_min_float_kernel(const float *x, float *out, int rows, int cols) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        const float *in_ptr = x + (int64_t)row * cols;
+        float *out_ptr = out + (int64_t)row * cols;
+        float m = in_ptr[0];
+        out_ptr[0] = m;
+        for (int c = 1; c < cols; ++c) {
+            float v = in_ptr[c];
+            if (v < m) {
+                m = v;
+            }
+            out_ptr[c] = m;
+        }
+    }
+}
+
+__mlu_entry__ void prefix_min_half_kernel(const half *x, half *out, int rows, int cols) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        const half *in_ptr = x + (int64_t)row * cols;
+        half *out_ptr = out + (int64_t)row * cols;
+        float m = (float)in_ptr[0];
+        out_ptr[0] = (half)m;
+        for (int c = 1; c < cols; ++c) {
+            float v = (float)in_ptr[c];
+            if (v < m) {
+                m = v;
+            }
+            out_ptr[c] = (half)m;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.dim() == 2, "expected 2D input");
+    TORCH_CHECK(dim == 1 || dim == -1, "only dim=1 is supported");
+    auto xc = x.contiguous();
+    int rows = (int)xc.size(0);
+    int cols = (int)xc.size(1);
+    auto out = torch::empty_like(xc);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {256, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (xc.scalar_type() == torch::kFloat32) {
+        prefix_min_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), out.data_ptr<float>(), rows, cols);
+    } else {
+        prefix_min_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()), rows, cols);
+    }
+    return out;
+}

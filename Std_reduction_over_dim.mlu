@@ -1,0 +1,66 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+
+__mlu_entry__ void reduce_var_float_kernel(const float *x, float *out, int bsz, int dim1, int dim2) {
+    int64_t total = (int64_t)bsz * dim2;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / dim2;
+        int j = idx - b * dim2;
+        int64_t base = ((int64_t)b * dim1 * dim2) + j;
+        float sum = 0.0f;
+        for (int i = 0; i < dim1; ++i) {
+            sum += x[base + (int64_t)i * dim2];
+        }
+        float mean = sum / (float)dim1;
+        float var = 0.0f;
+        for (int i = 0; i < dim1; ++i) {
+            float d = x[base + (int64_t)i * dim2] - mean;
+            var += d * d;
+        }
+        out[idx] = sqrtf(var / (float)(dim1 - 1));
+    }
+}
+
+__mlu_entry__ void reduce_var_half_kernel(const half *x, half *out, int bsz, int dim1, int dim2) {
+    int64_t total = (int64_t)bsz * dim2;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / dim2;
+        int j = idx - b * dim2;
+        int64_t base = ((int64_t)b * dim1 * dim2) + j;
+        float sum = 0.0f;
+        for (int i = 0; i < dim1; ++i) {
+            sum += (float)x[base + (int64_t)i * dim2];
+        }
+        float mean = sum / (float)dim1;
+        float var = 0.0f;
+        for (int i = 0; i < dim1; ++i) {
+            float d = (float)x[base + (int64_t)i * dim2] - mean;
+            var += d * d;
+        }
+        out[idx] = (half)sqrtf(var / (float)(dim1 - 1));
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.dim() == 3, "expected 3D input");
+    TORCH_CHECK(dim == 1 || dim == -2, "only dim=1 is supported");
+    auto xc = x.contiguous();
+    int bsz = (int)xc.size(0);
+    int dim1 = (int)xc.size(1);
+    int dim2 = (int)xc.size(2);
+    auto out = torch::empty({bsz, dim2}, xc.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (xc.scalar_type() == torch::kFloat32) {
+        reduce_var_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), out.data_ptr<float>(), bsz, dim1, dim2);
+    } else {
+        reduce_var_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()), bsz, dim1, dim2);
+    }
+    return out;
+}

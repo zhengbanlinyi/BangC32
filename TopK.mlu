@@ -1,0 +1,88 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <vector>
+
+__mlu_entry__ void select_float_kernel(const float *x, float *vals, int64_t *inds, int rows, int cols, int k) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float best_vals[16];
+        int best_inds[16];
+        for (int t = 0; t < k; ++t) {
+            best_vals[t] = -3.4028234663852886e38f;
+            best_inds[t] = 0;
+        }
+        const float *row_ptr = x + (int64_t)row * cols;
+        for (int c = 0; c < cols; ++c) {
+            float v = row_ptr[c];
+            if (v <= best_vals[k - 1]) {
+                continue;
+            }
+            int pos = k - 1;
+            while (pos > 0 && v > best_vals[pos - 1]) {
+                best_vals[pos] = best_vals[pos - 1];
+                best_inds[pos] = best_inds[pos - 1];
+                --pos;
+            }
+            best_vals[pos] = v;
+            best_inds[pos] = c;
+        }
+        for (int t = 0; t < k; ++t) {
+            vals[(int64_t)row * k + t] = best_vals[t];
+            inds[(int64_t)row * k + t] = (int64_t)best_inds[t];
+        }
+    }
+}
+
+__mlu_entry__ void select_half_kernel(const half *x, half *vals, int64_t *inds, int rows, int cols, int k) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float best_vals[16];
+        int best_inds[16];
+        for (int t = 0; t < k; ++t) {
+            best_vals[t] = -3.4028234663852886e38f;
+            best_inds[t] = 0;
+        }
+        const half *row_ptr = x + (int64_t)row * cols;
+        for (int c = 0; c < cols; ++c) {
+            float v = (float)row_ptr[c];
+            if (v <= best_vals[k - 1]) {
+                continue;
+            }
+            int pos = k - 1;
+            while (pos > 0 && v > best_vals[pos - 1]) {
+                best_vals[pos] = best_vals[pos - 1];
+                best_inds[pos] = best_inds[pos - 1];
+                --pos;
+            }
+            best_vals[pos] = v;
+            best_inds[pos] = c;
+        }
+        for (int t = 0; t < k; ++t) {
+            vals[(int64_t)row * k + t] = (half)best_vals[t];
+            inds[(int64_t)row * k + t] = (int64_t)best_inds[t];
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.dim() == 2, "expected 2D input");
+    TORCH_CHECK(dim == 1 || dim == -1, "only dim=1 is supported");
+    TORCH_CHECK(k <= 16, "k must be <= 16");
+    auto xc = x.contiguous();
+    int rows = (int)xc.size(0);
+    int cols = (int)xc.size(1);
+    auto vals = torch::empty({rows, k}, xc.options());
+    auto inds = torch::empty({rows, k}, xc.options().dtype(torch::kInt64));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {64, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (xc.scalar_type() == torch::kFloat32) {
+        select_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), vals.data_ptr<float>(),
+                                                    inds.data_ptr<int64_t>(), rows, cols, k);
+    } else {
+        select_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(vals.data_ptr<at::Half>()), inds.data_ptr<int64_t>(), rows, cols, k);
+    }
+    return {vals, inds};
+}

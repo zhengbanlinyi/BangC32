@@ -1,0 +1,71 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void order_float_kernel(const float *x, float *out, int rows, int cols, bool descending) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float vals[1024];
+        const float *row_ptr = x + (int64_t)row * cols;
+        for (int i = 0; i < cols; ++i) {
+            vals[i] = row_ptr[i];
+        }
+        for (int i = 1; i < cols; ++i) {
+            float key = vals[i];
+            int j = i - 1;
+            while (j >= 0 && (descending ? vals[j] < key : vals[j] > key)) {
+                vals[j + 1] = vals[j];
+                --j;
+            }
+            vals[j + 1] = key;
+        }
+        float *out_ptr = out + (int64_t)row * cols;
+        for (int i = 0; i < cols; ++i) {
+            out_ptr[i] = vals[i];
+        }
+    }
+}
+
+__mlu_entry__ void order_half_kernel(const half *x, half *out, int rows, int cols, bool descending) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float vals[1024];
+        const half *row_ptr = x + (int64_t)row * cols;
+        for (int i = 0; i < cols; ++i) {
+            vals[i] = (float)row_ptr[i];
+        }
+        for (int i = 1; i < cols; ++i) {
+            float key = vals[i];
+            int j = i - 1;
+            while (j >= 0 && (descending ? vals[j] < key : vals[j] > key)) {
+                vals[j + 1] = vals[j];
+                --j;
+            }
+            vals[j + 1] = key;
+        }
+        half *out_ptr = out + (int64_t)row * cols;
+        for (int i = 0; i < cols; ++i) {
+            out_ptr[i] = (half)vals[i];
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim, bool descending) {
+    TORCH_CHECK(x.dim() == 2, "expected 2D input");
+    TORCH_CHECK(dim == 1 || dim == -1, "only dim=1 is supported");
+    auto xc = x.contiguous();
+    int rows = (int)xc.size(0);
+    int cols = (int)xc.size(1);
+    TORCH_CHECK(cols <= 1024, "cols must be <= 1024");
+    auto out = torch::empty_like(xc);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {64, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (xc.scalar_type() == torch::kFloat32) {
+        order_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), out.data_ptr<float>(), rows, cols, descending);
+    } else {
+        order_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()), rows, cols, descending);
+    }
+    return out;
+}
