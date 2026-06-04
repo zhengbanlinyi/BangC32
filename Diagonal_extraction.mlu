@@ -1,0 +1,48 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define R089_B 32
+#define R089_N 512
+
+__mlu_entry__ void pick_stride_float_kernel(const float *input, float *output, int offset, int len) {
+    int64_t total = (int64_t)R089_B * len;
+    int row0 = offset >= 0 ? 0 : -offset;
+    int col0 = offset >= 0 ? offset : 0;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / len;
+        int t = idx - (int64_t)b * len;
+        output[idx] = input[(int64_t)b * R089_N * R089_N + (int64_t)(row0 + t) * R089_N + (col0 + t)];
+    }
+}
+
+__mlu_entry__ void pick_stride_half_kernel(const half *input, half *output, int offset, int len) {
+    int64_t total = (int64_t)R089_B * len;
+    int row0 = offset >= 0 ? 0 : -offset;
+    int col0 = offset >= 0 ? offset : 0;
+    for (int64_t idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / len;
+        int t = idx - (int64_t)b * len;
+        output[idx] = input[(int64_t)b * R089_N * R089_N + (int64_t)(row0 + t) * R089_N + (col0 + t)];
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, int offset) {
+    auto Ac = A.contiguous();
+    TORCH_CHECK(Ac.dim() == 3 && Ac.size(0) == R089_B && Ac.size(1) == R089_N && Ac.size(2) == R089_N,
+                "Only shape [32, 512, 512] is supported");
+    int len = R089_N - (offset >= 0 ? offset : -offset);
+    auto output = torch::empty({Ac.size(0), len}, Ac.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (Ac.scalar_type() == torch::kHalf) {
+        pick_stride_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()), offset, len);
+        return output;
+    }
+    pick_stride_float_kernel<<<grid, ktype, queue>>>(Ac.data_ptr<float>(), output.data_ptr<float>(), offset, len);
+    return output;
+}

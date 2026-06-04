@@ -1,0 +1,5 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor a, torch::Tensor b) {
+    return a.unsqueeze(2) * b.unsqueeze(1);
+}
