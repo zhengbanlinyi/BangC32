@@ -4,63 +4,101 @@
 #include <math.h>
 #include <stdint.h>
 
-__mlu_entry__ void reduce_var_float_kernel(const float *x, float *out, int bsz, int dim1, int dim2) {
-    int64_t total = (int64_t)bsz * dim2;
-    for (int64_t idx = taskId; idx < total; idx += taskDim) {
-        int b = idx / dim2;
-        int j = idx - b * dim2;
-        int64_t base = ((int64_t)b * dim1 * dim2) + j;
-        float sum = 0.0f;
-        for (int i = 0; i < dim1; ++i) {
-            sum += x[base + (int64_t)i * dim2];
-        }
-        float mean = sum / (float)dim1;
-        float var = 0.0f;
-        for (int i = 0; i < dim1; ++i) {
-            float d = x[base + (int64_t)i * dim2] - mean;
-            var += d * d;
-        }
-        out[idx] = sqrtf(var / (float)(dim1 - 1));
+#define R074_B 16
+#define R074_D1 256
+#define R074_D2 256
+#define R074_PLANE (R074_D1 * R074_D2)
+
+__mlu_entry__ void reduce_var_float_kernel(const float *input, float *output) {
+    int n = taskId;
+    if (n >= R074_B) {
+        return;
     }
+
+    __nram__ float data[R074_PLANE];
+    __nram__ float mean[R074_D2];
+    __nram__ float acc[R074_D2];
+
+    int base = n * R074_PLANE;
+    __memcpy(data, input + base, R074_PLANE * sizeof(float), GDRAM2NRAM);
+
+    for (int rows = R074_D1; rows > 1; rows >>= 1) {
+        int len = (rows >> 1) * R074_D2;
+        __bang_add(data, data, data + len, len);
+    }
+    __bang_mul_scalar(mean, data, 1.0f / (float)R074_D1, R074_D2);
+    __bang_mul_scalar(acc, mean, 0.0f, R074_D2);
+
+    __memcpy(data, input + base, R074_PLANE * sizeof(float), GDRAM2NRAM);
+    for (int i = 0; i < R074_D1; ++i) {
+        float *row = data + i * R074_D2;
+        __bang_sub(row, row, mean, R074_D2);
+        __bang_mul(row, row, row, R074_D2);
+        __bang_add(acc, acc, row, R074_D2);
+    }
+
+    for (int j = 0; j < R074_D2; ++j) {
+        acc[j] = sqrtf(acc[j] / (float)(R074_D1 - 1));
+    }
+    __memcpy(output + n * R074_D2, acc, R074_D2 * sizeof(float), NRAM2GDRAM);
 }
 
-__mlu_entry__ void reduce_var_half_kernel(const half *x, half *out, int bsz, int dim1, int dim2) {
-    int64_t total = (int64_t)bsz * dim2;
-    for (int64_t idx = taskId; idx < total; idx += taskDim) {
-        int b = idx / dim2;
-        int j = idx - b * dim2;
-        int64_t base = ((int64_t)b * dim1 * dim2) + j;
-        float sum = 0.0f;
-        for (int i = 0; i < dim1; ++i) {
-            sum += (float)x[base + (int64_t)i * dim2];
-        }
-        float mean = sum / (float)dim1;
-        float var = 0.0f;
-        for (int i = 0; i < dim1; ++i) {
-            float d = (float)x[base + (int64_t)i * dim2] - mean;
-            var += d * d;
-        }
-        out[idx] = (half)sqrtf(var / (float)(dim1 - 1));
+__mlu_entry__ void reduce_var_half_kernel(const half *input, half *output) {
+    int n = taskId;
+    if (n >= R074_B) {
+        return;
     }
+
+    __nram__ half half_buf[R074_PLANE];
+    __nram__ float data[R074_PLANE];
+    __nram__ float mean[R074_D2];
+    __nram__ float acc[R074_D2];
+
+    int base = n * R074_PLANE;
+    __memcpy(half_buf, input + base, R074_PLANE * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(data, half_buf, R074_PLANE);
+
+    for (int rows = R074_D1; rows > 1; rows >>= 1) {
+        int len = (rows >> 1) * R074_D2;
+        __bang_add(data, data, data + len, len);
+    }
+    __bang_mul_scalar(mean, data, 1.0f / (float)R074_D1, R074_D2);
+    __bang_mul_scalar(acc, mean, 0.0f, R074_D2);
+
+    __memcpy(half_buf, input + base, R074_PLANE * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(data, half_buf, R074_PLANE);
+    for (int i = 0; i < R074_D1; ++i) {
+        float *row = data + i * R074_D2;
+        __bang_sub(row, row, mean, R074_D2);
+        __bang_mul(row, row, row, R074_D2);
+        __bang_add(acc, acc, row, R074_D2);
+    }
+
+    for (int j = 0; j < R074_D2; ++j) {
+        acc[j] = sqrtf(acc[j] / (float)(R074_D1 - 1));
+    }
+    __bang_float2half_rd(half_buf, acc, R074_D2);
+    __memcpy(output + n * R074_D2, half_buf, R074_D2 * sizeof(half), NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.dim() == 3, "expected 3D input");
-    TORCH_CHECK(dim == 1 || dim == -2, "only dim=1 is supported");
-    auto xc = x.contiguous();
-    int bsz = (int)xc.size(0);
-    int dim1 = (int)xc.size(1);
-    int dim2 = (int)xc.size(2);
-    auto out = torch::empty({bsz, dim2}, xc.options());
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == R074_B && x.size(1) == R074_D1 &&
+                    x.size(2) == R074_D2 && dim == 1,
+                "Only shape [16, 256, 256] dim=1 is supported");
+
+    auto output = torch::empty({x.size(0), x.size(2)}, x.options());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {512, 1, 1};
+    cnrtDim3_t grid = {R074_B, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (xc.scalar_type() == torch::kFloat32) {
-        reduce_var_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), out.data_ptr<float>(), bsz, dim1, dim2);
-    } else {
+
+    if (x.scalar_type() == torch::kHalf) {
         reduce_var_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()), bsz, dim1, dim2);
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        return output;
     }
-    return out;
+
+    reduce_var_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>());
+    return output;
 }

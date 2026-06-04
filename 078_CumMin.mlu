@@ -3,54 +3,80 @@
 #include <cnrt.h>
 #include <stdint.h>
 
-__mlu_entry__ void prefix_min_float_kernel(const float *x, float *out, int rows, int cols) {
-    for (int row = taskId; row < rows; row += taskDim) {
-        const float *in_ptr = x + (int64_t)row * cols;
-        float *out_ptr = out + (int64_t)row * cols;
-        float m = in_ptr[0];
-        out_ptr[0] = m;
-        for (int c = 1; c < cols; ++c) {
-            float v = in_ptr[c];
-            if (v < m) {
-                m = v;
-            }
-            out_ptr[c] = m;
-        }
+#define R078_ROWS 128
+#define R078_COLS 4000
+
+__mlu_entry__ void prefix_min_float_kernel(const float *input, float *output) {
+    int row = taskId;
+    if (row >= R078_ROWS) {
+        return;
     }
+
+    __nram__ float data[R078_COLS];
+    __nram__ float diff[R078_COLS];
+    __nram__ float sum_buf[R078_COLS];
+
+    const float *row_in = input + (int64_t)row * R078_COLS;
+    float *row_out = output + (int64_t)row * R078_COLS;
+    __memcpy(data, row_in, R078_COLS * sizeof(float), GDRAM2NRAM);
+
+    for (int offset = 1; offset < R078_COLS; offset <<= 1) {
+        int len = R078_COLS - offset;
+        __bang_sub(diff, data + offset, data, len);
+        __bang_abs(diff, diff, len);
+        __bang_add(sum_buf, data + offset, data, len);
+        __bang_sub(sum_buf, sum_buf, diff, len);
+        __bang_mul_scalar(data + offset, sum_buf, 0.5f, len);
+    }
+
+    __memcpy(row_out, data, R078_COLS * sizeof(float), NRAM2GDRAM);
 }
 
-__mlu_entry__ void prefix_min_half_kernel(const half *x, half *out, int rows, int cols) {
-    for (int row = taskId; row < rows; row += taskDim) {
-        const half *in_ptr = x + (int64_t)row * cols;
-        half *out_ptr = out + (int64_t)row * cols;
-        float m = (float)in_ptr[0];
-        out_ptr[0] = (half)m;
-        for (int c = 1; c < cols; ++c) {
-            float v = (float)in_ptr[c];
-            if (v < m) {
-                m = v;
-            }
-            out_ptr[c] = (half)m;
-        }
+__mlu_entry__ void prefix_min_half_kernel(const half *input, half *output) {
+    int row = taskId;
+    if (row >= R078_ROWS) {
+        return;
     }
+
+    __nram__ half half_buf[R078_COLS];
+    __nram__ float data[R078_COLS];
+    __nram__ float diff[R078_COLS];
+    __nram__ float sum_buf[R078_COLS];
+
+    const half *row_in = input + (int64_t)row * R078_COLS;
+    half *row_out = output + (int64_t)row * R078_COLS;
+    __memcpy(half_buf, row_in, R078_COLS * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(data, half_buf, R078_COLS);
+
+    for (int offset = 1; offset < R078_COLS; offset <<= 1) {
+        int len = R078_COLS - offset;
+        __bang_sub(diff, data + offset, data, len);
+        __bang_abs(diff, diff, len);
+        __bang_add(sum_buf, data + offset, data, len);
+        __bang_sub(sum_buf, sum_buf, diff, len);
+        __bang_mul_scalar(data + offset, sum_buf, 0.5f, len);
+    }
+
+    __bang_float2half_rd(half_buf, data, R078_COLS);
+    __memcpy(row_out, half_buf, R078_COLS * sizeof(half), NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.dim() == 2, "expected 2D input");
-    TORCH_CHECK(dim == 1 || dim == -1, "only dim=1 is supported");
-    auto xc = x.contiguous();
-    int rows = (int)xc.size(0);
-    int cols = (int)xc.size(1);
-    auto out = torch::empty_like(xc);
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == R078_ROWS && x.size(1) == R078_COLS &&
+                    (dim == 1 || dim == -1),
+                "Only shape [128, 4000] dim=1 is supported");
+
+    auto out = torch::empty_like(x);
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {256, 1, 1};
+    cnrtDim3_t grid = {R078_ROWS, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (xc.scalar_type() == torch::kFloat32) {
-        prefix_min_float_kernel<<<grid, ktype, queue>>>(xc.data_ptr<float>(), out.data_ptr<float>(), rows, cols);
-    } else {
+    if (x.scalar_type() == torch::kHalf) {
         prefix_min_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(xc.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()), rows, cols);
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()));
+        return out;
     }
+    prefix_min_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), out.data_ptr<float>());
     return out;
 }
