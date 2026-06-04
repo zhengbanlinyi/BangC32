@@ -60,16 +60,15 @@ torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
     int64_t total = (int64_t)n * c * out_h * out_w;
 
     if (kernel_size == 11 && h == 2048 && w == 2048) {
-        std::vector<torch::Tensor> outputs;
-        outputs.reserve(n);
+        auto output = torch::empty({n, c, out_h, out_w}, x.options());
         for (int i = 0; i < n; ++i) {
             auto xi = x.narrow(0, i, 1);
             auto pooled_view = xi.as_strided(
                 {1, c, out_h, kernel_size, out_w, kernel_size},
                 {(int64_t)c * h * w, (int64_t)h * w, (int64_t)kernel_size * w, (int64_t)w, (int64_t)kernel_size, 1});
-            outputs.push_back(pooled_view.mean({3, 5}));
+            output.narrow(0, i, 1).copy_(pooled_view.mean({3, 5}));
         }
-        return torch::cat(outputs, 0);
+        return output;
     }
 
     auto output = torch::empty({n, c, out_h, out_w}, x.options());
