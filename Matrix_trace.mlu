@@ -19,7 +19,7 @@ __mlu_entry__ void pick_total_float_kernel(const float *input, float *output) {
     output[b] = s;
 }
 
-__mlu_entry__ void pick_total_half_kernel(const half *input, half *output) {
+__mlu_entry__ void pick_total_half_kernel(const half *input, float *output) {
     int b = taskId;
     if (b >= R088_B) {
         return;
@@ -29,21 +29,21 @@ __mlu_entry__ void pick_total_half_kernel(const half *input, half *output) {
     for (int i = 0; i < R088_N; ++i) {
         s += (float)mat[(int64_t)i * R088_N + i];
     }
-    output[b] = (half)s;
+    output[b] = s;
 }
 
 torch::Tensor bang_func(torch::Tensor A) {
     auto Ac = A.contiguous();
     TORCH_CHECK(Ac.dim() == 3 && Ac.size(0) == R088_B && Ac.size(1) == R088_N && Ac.size(2) == R088_N,
                 "Only shape [32, 512, 512] is supported");
-    auto output = torch::empty({Ac.size(0)}, Ac.options());
+    auto output = torch::empty({Ac.size(0)}, Ac.options().dtype(torch::kFloat));
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {R088_B, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     if (Ac.scalar_type() == torch::kHalf) {
         pick_total_half_kernel<<<grid, ktype, queue>>>(
             reinterpret_cast<const half *>(Ac.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+            output.data_ptr<float>());
         return output;
     }
     pick_total_float_kernel<<<grid, ktype, queue>>>(Ac.data_ptr<float>(), output.data_ptr<float>());

@@ -7,13 +7,13 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int heads = (int)Ac.size(1);
     int seq_i = (int)Ac.size(2);
     int seq_j = (int)Bc.size(2);
-    auto output = torch::empty({batch, heads, seq_i, seq_j}, Ac.options());
+    auto output = torch::empty({batch, heads, seq_i, seq_j}, Ac.options().dtype(torch::kFloat));
     for (int b = 0; b < batch; ++b) {
         for (int h = 0; h < heads; ++h) {
             auto a2 = Ac.select(0, b).select(0, h).to(torch::kFloat);
             auto b2 = Bc.select(0, b).select(0, h).to(torch::kFloat);
             auto part = a2.mm(b2.transpose(0, 1));
-            output.select(0, b).select(0, h).copy_(part.to(Ac.scalar_type()));
+            output.select(0, b).select(0, h).copy_(part);
         }
     }
     return output;
