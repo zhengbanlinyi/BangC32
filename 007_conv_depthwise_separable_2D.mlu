@@ -24,12 +24,21 @@ torch::Tensor bang_func(
     int out_w = (w + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
     int64_t rows = (int64_t)n * out_h * out_w;
 
-    auto patches = x.to(torch::kFloat)
-                       .unfold(2, kernel_size, stride)
-                       .unfold(3, kernel_size, stride);
-    auto depthwise = patches
-                         .mul(depthwise_kernel.to(torch::kFloat).view({1, in_channels, 1, 1, kernel_size, kernel_size}))
-                         .sum({4, 5});
+    auto x_f = x.to(torch::kFloat);
+    auto depthwise_weights = depthwise_kernel.to(torch::kFloat).select(1, 0);
+    auto depthwise = x_f.narrow(2, 0, out_h)
+                         .narrow(3, 0, out_w)
+                         .mul(depthwise_weights.select(1, 0).select(1, 0).view({1, in_channels, 1, 1}));
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            if (kh == 0 && kw == 0) {
+                continue;
+            }
+            auto values = x_f.narrow(2, kh * stride, out_h).narrow(3, kw * stride, out_w);
+            auto weights = depthwise_weights.select(1, kh).select(1, kw).view({1, in_channels, 1, 1});
+            depthwise.add_(values.mul(weights));
+        }
+    }
     auto depthwise_rows = depthwise.permute({0, 2, 3, 1}).contiguous().view({rows, in_channels});
     auto pointwise = pointwise_kernel.to(torch::kFloat).view({out_channels, in_channels}).t();
     return depthwise_rows.mm(pointwise)
