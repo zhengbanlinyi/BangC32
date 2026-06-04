@@ -6,7 +6,7 @@
 constexpr int kBlockThreads = 128;
 constexpr int kItemsPerThread = 4;
 
-__mlu_entry__ void block_sums_half_kernel(const half *input, half *output, int64_t n, int elems_per_block, int num_blocks) {
+__mlu_entry__ void block_sums_half_kernel(const half *input, float *output, int64_t n, int elems_per_block, int num_blocks) {
     int block = taskId;
     if (block >= num_blocks) {
         return;
@@ -20,7 +20,7 @@ __mlu_entry__ void block_sums_half_kernel(const half *input, half *output, int64
     for (int64_t i = start; i < end; ++i) {
         acc += (float)input[i];
     }
-    output[block] = (half)acc;
+    output[block] = acc;
 }
 
 __mlu_entry__ void block_sums_float_kernel(const float *input, float *output, int64_t n, int elems_per_block, int num_blocks) {
@@ -45,14 +45,14 @@ torch::Tensor bang_func(torch::Tensor input, int iters_per_cta) {
     int elems_per_block = kBlockThreads * kItemsPerThread * iters_per_cta;
     int64_t n = input.numel();
     int num_blocks = (int)((n + elems_per_block - 1) / elems_per_block);
-    auto output = torch::empty({num_blocks}, input.options());
+    auto output = torch::empty({num_blocks}, input.options().dtype(torch::kFloat));
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {(unsigned int)num_blocks, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     if (input.scalar_type() == torch::kHalf) {
         block_sums_half_kernel<<<grid, ktype, queue>>>(
             reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            output.data_ptr<float>(),
             n, elems_per_block, num_blocks);
     } else {
         block_sums_float_kernel<<<grid, ktype, queue>>>(
