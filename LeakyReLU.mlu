@@ -1,13 +1,111 @@
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define LEAKY_CHUNK 16384
+#define LEAKY_TASKS 512
+
+__mlu_entry__ void leakyrelu_float_kernel(
+    const float *input,
+    float *output,
+    int total,
+    float negative_slope) {
+
+    __nram__ float nram_data[LEAKY_CHUNK];
+    __nram__ float nram_relu[LEAKY_CHUNK];
+
+    for (uint32_t base = taskId * LEAKY_CHUNK; base < (uint32_t)total; base += taskDim * LEAKY_CHUNK) {
+        uint32_t len = (base + LEAKY_CHUNK <= (uint32_t)total)
+                           ? LEAKY_CHUNK
+                           : ((uint32_t)total - base);
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_data, input + base, len * sizeof(float), GDRAM2NRAM);
+        __bang_active_relu(nram_relu, nram_data, aligned_len);
+        __bang_sub(nram_data, nram_data, nram_relu, aligned_len);
+        __bang_fusion(
+            FUSION_FMA,
+            nram_data,
+            nram_data,
+            negative_slope,
+            nram_relu,
+            aligned_len,
+            aligned_len);
+        __memcpy(output + base, nram_data, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+__mlu_entry__ void leakyrelu_half_kernel(
+    const half *input,
+    half *output,
+    int total,
+    float negative_slope) {
+
+    __nram__ half nram_data[LEAKY_CHUNK];
+    __nram__ half nram_relu[LEAKY_CHUNK];
+    half slope_h = (half)negative_slope;
+
+    for (uint32_t base = taskId * LEAKY_CHUNK; base < (uint32_t)total; base += taskDim * LEAKY_CHUNK) {
+        uint32_t len = (base + LEAKY_CHUNK <= (uint32_t)total)
+                           ? LEAKY_CHUNK
+                           : ((uint32_t)total - base);
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_data, input + base, len * sizeof(half), GDRAM2NRAM);
+        __bang_active_relu(nram_relu, nram_data, aligned_len);
+        __bang_sub(nram_data, nram_data, nram_relu, aligned_len);
+        __bang_fusion(
+            FUSION_FMA,
+            nram_data,
+            nram_data,
+            slope_h,
+            nram_relu,
+            aligned_len,
+            aligned_len);
+        __memcpy(output + base, nram_data, len * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+static inline int leaky_tasks(int total) {
+    int tasks = (total + LEAKY_CHUNK - 1) / LEAKY_CHUNK;
+    if (tasks < 1) {
+        tasks = 1;
+    }
+    if (tasks > LEAKY_TASKS) {
+        tasks = LEAKY_TASKS;
+    }
+    return tasks;
+}
 
 torch::Tensor bang_func(
     torch::Tensor input,
     double negative_slope) {
 
-    auto x = input.to(torch::kFloat);
-    auto y = x.clamp_min(0.0).add(x.clamp_max(0.0).mul(negative_slope));
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+
+    auto output = torch::empty_like(input);
+    int total = (int)input.numel();
+    int tasks = leaky_tasks(total);
+    float slope = (float)negative_slope;
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {(unsigned int)tasks, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
     if (input.scalar_type() == torch::kHalf) {
-        return y.to(torch::kHalf);
+        leakyrelu_half_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            total,
+            slope);
+        return output;
     }
-    return y;
+
+    leakyrelu_float_kernel<<<dim, ktype, queue>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total,
+        slope);
+    return output;
 }

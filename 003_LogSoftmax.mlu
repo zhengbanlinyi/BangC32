@@ -1,5 +1,117 @@
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define LOGSOFTMAX_COLS 16384
+#define LOGSOFTMAX_TASKS 16
+#define LOGSOFTMAX_LN2 0.6931471805599453f
+
+__mlu_entry__ void logsoftmax_half_kernel(
+    const half *input,
+    half *output,
+    int rows,
+    int cols) {
+
+    uint32_t row = taskId;
+    if (row >= (uint32_t)rows || cols != LOGSOFTMAX_COLS) {
+        return;
+    }
+
+    __nram__ half nram_half[LOGSOFTMAX_COLS];
+    __nram__ float nram_shift[LOGSOFTMAX_COLS];
+    __nram__ float nram_exp[LOGSOFTMAX_COLS];
+    __nram__ float nram_reduce[64];
+
+    const half *row_in = input + row * cols;
+    half *row_out = output + row * cols;
+
+    __memcpy(nram_half, row_in, cols * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_shift, nram_half, cols);
+
+    __bang_argmax(nram_reduce, nram_shift, cols);
+    float row_max = nram_reduce[0];
+
+    __bang_sub_scalar(nram_shift, nram_shift, row_max, cols);
+    __bang_active_exphp(nram_exp, nram_shift, cols);
+
+    float sum_total = 0.0f;
+    for (int i = 0; i < LOGSOFTMAX_COLS; ++i) {
+        sum_total += nram_exp[i];
+    }
+    __bang_write_value(nram_reduce, 64, sum_total);
+    __bang_log2(nram_reduce, nram_reduce, 64);
+    __bang_mul_scalar(nram_reduce, nram_reduce, LOGSOFTMAX_LN2, 64);
+
+    __bang_sub_scalar(nram_shift, nram_shift, nram_reduce[0], cols);
+    __bang_float2half_rd(nram_half, nram_shift, cols);
+    __memcpy(row_out, nram_half, cols * sizeof(half), NRAM2GDRAM);
+}
+
+__mlu_entry__ void logsoftmax_float_kernel(
+    const float *input,
+    float *output,
+    int rows,
+    int cols) {
+
+    uint32_t row = taskId;
+    if (row >= (uint32_t)rows || cols != LOGSOFTMAX_COLS) {
+        return;
+    }
+
+    __nram__ float nram_shift[LOGSOFTMAX_COLS];
+    __nram__ float nram_exp[LOGSOFTMAX_COLS];
+    __nram__ float nram_reduce[64];
+
+    const float *row_in = input + row * cols;
+    float *row_out = output + row * cols;
+
+    __memcpy(nram_shift, row_in, cols * sizeof(float), GDRAM2NRAM);
+
+    __bang_argmax(nram_reduce, nram_shift, cols);
+    float row_max = nram_reduce[0];
+
+    __bang_sub_scalar(nram_shift, nram_shift, row_max, cols);
+    __bang_active_exphp(nram_exp, nram_shift, cols);
+
+    float sum_total = 0.0f;
+    for (int i = 0; i < LOGSOFTMAX_COLS; ++i) {
+        sum_total += nram_exp[i];
+    }
+    __bang_write_value(nram_reduce, 64, sum_total);
+    __bang_log2(nram_reduce, nram_reduce, 64);
+    __bang_mul_scalar(nram_reduce, nram_reduce, LOGSOFTMAX_LN2, 64);
+
+    __bang_sub_scalar(nram_shift, nram_shift, nram_reduce[0], cols);
+    __memcpy(row_out, nram_shift, cols * sizeof(float), NRAM2GDRAM);
+}
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    return x.log_softmax(dim);
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "LogSoftmax expects a 2D input");
+    TORCH_CHECK(dim == 1 || dim == -1, "Only the last dimension is supported");
+
+    auto output = torch::empty_like(x);
+    int rows = (int)x.size(0);
+    int cols = (int)x.size(1);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {LOGSOFTMAX_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (x.scalar_type() == torch::kHalf) {
+        logsoftmax_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            rows,
+            cols);
+        return output;
+    }
+
+    logsoftmax_float_kernel<<<grid, ktype, queue>>>(
+        x.data_ptr<float>(),
+        output.data_ptr<float>(),
+        rows,
+        cols);
+    return output;
 }

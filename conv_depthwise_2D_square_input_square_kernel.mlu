@@ -15,10 +15,25 @@ torch::Tensor bang_func(
     int n = (int)x.size(0);
     int h = (int)x.size(2);
     int w = (int)x.size(3);
+    int out_h = (h - kernel_size) / stride + 1;
+    int out_w = (w - kernel_size) / stride + 1;
 
-    auto patches = x.to(torch::kFloat)
-                       .unfold(2, kernel_size, stride)
-                       .unfold(3, kernel_size, stride);
-    auto weights = kernel.to(torch::kFloat).view({1, in_channels, 1, 1, kernel_size, kernel_size});
-    return patches.mul(weights).sum({4, 5}).contiguous();
+    auto x_f = x.to(torch::kFloat);
+    auto k_f = kernel.to(torch::kFloat).select(1, 0);
+    auto output = x_f.narrow(2, 0, out_h)
+                     .narrow(3, 0, out_w)
+                     .mul(k_f.select(1, 0).select(1, 0).view({1, in_channels, 1, 1}));
+
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            if (kh == 0 && kw == 0) {
+                continue;
+            }
+            auto values = x_f.narrow(2, kh * stride, out_h).narrow(3, kw * stride, out_w);
+            auto weights = k_f.select(1, kh).select(1, kw).view({1, in_channels, 1, 1});
+            output.add_(values.mul(weights));
+        }
+    }
+
+    return output.contiguous();
 }
