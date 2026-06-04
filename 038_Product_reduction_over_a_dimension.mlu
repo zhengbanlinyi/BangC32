@@ -6,32 +6,47 @@
 #define REDUCE_B 16
 #define REDUCE_D1 256
 #define REDUCE_D2 256
-#define REDUCE_TASKS 4096
+#define REDUCE_PLANE (REDUCE_D1 * REDUCE_D2)
 
-__mlu_entry__ void prod_dim1_half_kernel(const half *input, half *output, int total) {
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int n = idx / REDUCE_D2;
-        int d2 = idx - n * REDUCE_D2;
-        int base = n * REDUCE_D1 * REDUCE_D2 + d2;
-        float prod = 1.0f;
-        for (int i = 0; i < REDUCE_D1; ++i) {
-            prod *= (float)input[base + i * REDUCE_D2];
-        }
-        output[idx] = (half)prod;
+__mlu_entry__ void prod_dim1_half_kernel(const half *input, half *output) {
+    int n = taskId;
+    if (n >= REDUCE_B) {
+        return;
     }
+
+    __nram__ half nram_half[REDUCE_PLANE];
+    __nram__ float nram_x[REDUCE_PLANE];
+
+    int base = n * REDUCE_PLANE;
+    __memcpy(nram_half, input + base, REDUCE_PLANE * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_half, REDUCE_PLANE);
+
+    for (int rows = REDUCE_D1; rows > 1; rows >>= 1) {
+        int len = (rows >> 1) * REDUCE_D2;
+        __bang_mul(nram_x, nram_x, nram_x + len, len);
+    }
+
+    __bang_float2half_rd(nram_half, nram_x, REDUCE_D2);
+    __memcpy(output + n * REDUCE_D2, nram_half, REDUCE_D2 * sizeof(half), NRAM2GDRAM);
 }
 
-__mlu_entry__ void prod_dim1_float_kernel(const float *input, float *output, int total) {
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int n = idx / REDUCE_D2;
-        int d2 = idx - n * REDUCE_D2;
-        int base = n * REDUCE_D1 * REDUCE_D2 + d2;
-        float prod = 1.0f;
-        for (int i = 0; i < REDUCE_D1; ++i) {
-            prod *= input[base + i * REDUCE_D2];
-        }
-        output[idx] = prod;
+__mlu_entry__ void prod_dim1_float_kernel(const float *input, float *output) {
+    int n = taskId;
+    if (n >= REDUCE_B) {
+        return;
     }
+
+    __nram__ float nram_x[REDUCE_PLANE];
+
+    int base = n * REDUCE_PLANE;
+    __memcpy(nram_x, input + base, REDUCE_PLANE * sizeof(float), GDRAM2NRAM);
+
+    for (int rows = REDUCE_D1; rows > 1; rows >>= 1) {
+        int len = (rows >> 1) * REDUCE_D2;
+        __bang_mul(nram_x, nram_x, nram_x + len, len);
+    }
+
+    __memcpy(output + n * REDUCE_D2, nram_x, REDUCE_D2 * sizeof(float), NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
@@ -39,19 +54,17 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.dim() == 3 && dim == 1, "Only shape [16, 256, 256] dim=1 is supported");
 
     auto output = torch::empty({x.size(0), x.size(2)}, x.options());
-    int total = (int)output.numel();
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {REDUCE_TASKS, 1, 1};
+    cnrtDim3_t grid = {REDUCE_B, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (x.scalar_type() == torch::kHalf) {
         prod_dim1_half_kernel<<<grid, ktype, queue>>>(
             reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-            total);
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
         return output;
     }
 
-    prod_dim1_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>(), total);
+    prod_dim1_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>());
     return output;
 }

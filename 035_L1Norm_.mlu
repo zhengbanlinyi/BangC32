@@ -1,4 +1,6 @@
 #include <bang.h>
+#include <bang_device_functions_math.h>
+#include <bang_device_functions_extra.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
