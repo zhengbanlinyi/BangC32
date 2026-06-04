@@ -1,0 +1,18 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x) {
+    auto xf = x.to(torch::kFloat);
+    auto x2 = xf * xf;
+    auto y = x2 * 4.779477332387385e-14 - 1.1470745597729725e-11;
+    y = y * x2 + 2.08767569878681e-9;
+    y = y * x2 - 2.755731922398589e-7;
+    y = y * x2 + 2.48015873015873e-5;
+    y = y * x2 - 0.001388888888888889;
+    y = y * x2 + 0.041666666666666664;
+    y = y * x2 - 0.5;
+    y = y * x2 + 1.0;
+    if (x.scalar_type() == torch::kFloat32) {
+        return y;
+    }
+    return y.to(x.scalar_type());
+}
