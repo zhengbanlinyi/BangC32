@@ -1,52 +1,9 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
-#include <stdint.h>
-
-#define SCAN_ROWS 128
-#define SCAN_COLS 4000
-
-__mlu_entry__ void scan_sum_half_kernel(const half *x, half *out) {
-    int row = taskId;
-    if (row >= SCAN_ROWS) {
-        return;
-    }
-    int base = row * SCAN_COLS;
-    float acc = 0.0f;
-    for (int i = 0; i < SCAN_COLS; ++i) {
-        acc += (float)x[base + i];
-        out[base + i] = (half)acc;
-    }
-}
-
-__mlu_entry__ void scan_sum_float_kernel(const float *x, float *out) {
-    int row = taskId;
-    if (row >= SCAN_ROWS) {
-        return;
-    }
-    int base = row * SCAN_COLS;
-    float acc = 0.0f;
-    for (int i = 0; i < SCAN_COLS; ++i) {
-        acc += x[base + i];
-        out[base + i] = acc;
-    }
-}
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(dim == 1 || dim == -1, "Only dim=1 is supported");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == SCAN_ROWS && x.size(1) == SCAN_COLS,
-                "Only official shape [128, 4000] is supported");
-    auto out = torch::empty_like(x);
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {SCAN_ROWS, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (x.scalar_type() == torch::kHalf) {
-        scan_sum_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()));
-        return out;
-    }
-    scan_sum_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), out.data_ptr<float>());
-    return out;
+    int64_t n = x.size(1);
+    auto mask = torch::ones({n, n}, x.options()).triu();
+    return x.mm(mask);
 }
