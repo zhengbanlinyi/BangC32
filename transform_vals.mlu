@@ -1,35 +1,5 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
-#include <stdint.h>
-
-__mlu_entry__ void add_half_kernel(const half *a, const half *b, half *out, int64_t n) {
-    int64_t stride = taskDim;
-    for (int64_t i = taskId; i < n; i += stride) {
-        out[i] = (half)((float)a[i] + (float)b[i]);
-    }
-}
-
-__mlu_entry__ void add_float_kernel(const float *a, const float *b, float *out, int64_t n) {
-    int64_t stride = taskDim;
-    for (int64_t i = taskId; i < n; i += stride) {
-        out[i] = a[i] + b[i];
-    }
-}
 
 torch::Tensor bang_func(torch::Tensor a, torch::Tensor b) {
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "inputs must be contiguous");
-    auto out = torch::empty_like(a);
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {512, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (a.scalar_type() == torch::kHalf) {
-        add_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(a.data_ptr<at::Half>()),
-            reinterpret_cast<const half *>(b.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()), a.numel());
-    } else {
-        add_float_kernel<<<grid, ktype, queue>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), a.numel());
-    }
-    return out;
+    return a + b;
 }
