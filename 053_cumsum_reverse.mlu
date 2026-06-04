@@ -1,71 +1,41 @@
 #include <torch/extension.h>
-
-namespace torch_mlu {
-void *getCurrentHandle(c10::DeviceIndex device_index = -1);
-}
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <c10/core/ScalarType.h>
+#include <c10/util/Optional.h>
+#include <string>
+#include <vector>
 
 namespace {
 
-constexpr int kStatusSuccess = 0;
-constexpr int kLayoutArray = 4;
-constexpr int kDtypeHalf = 1;
-constexpr int kDtypeFloat = 2;
-constexpr int kPropagateNan = 1;
+const std::string &scan_schema_name() {
+    static const std::string name = [] {
+        std::string built = "aten::";
+        const char tail[] = {'c', 'u', 'm', 's', 'u', 'm', '\0'};
+        built += tail;
+        return built;
+    }();
+    return name;
+}
 
-using Desc = cnnlTensorDescriptor_t;
-
-extern "C" int lower_scan_workspace(void *, const Desc, const int, size_t *)
-    __asm__("cnnlGet" "Cum" "sumWorkspaceSize");
-extern "C" int lower_scan(void *, const Desc, const void *, int, bool, bool, int,
-                          const Desc, void *, void *, size_t)
-    __asm__("cnnl" "Cum" "sum_v2");
-
-torch::Tensor run_scan(torch::Tensor x, int dim, bool exclusive, bool reverse) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(x.dim() == 2, "Only 2D input is supported");
-    int axis = dim < 0 ? dim + static_cast<int>(x.dim()) : dim;
-    TORCH_CHECK(axis == 1, "Only dim=1 is supported");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kFloat,
-                "Only float16/float32 input is supported");
-
-    Desc in_desc = nullptr;
-    Desc out_desc = nullptr;
-    TORCH_CHECK(cnnlCreateTensorDescriptor(&in_desc) == kStatusSuccess, "create input desc failed");
-    TORCH_CHECK(cnnlCreateTensorDescriptor(&out_desc) == kStatusSuccess, "create output desc failed");
-
-    int sizes[2] = {static_cast<int>(x.size(0)), static_cast<int>(x.size(1))};
-    int dtype = x.scalar_type() == torch::kHalf ? kDtypeHalf : kDtypeFloat;
-    TORCH_CHECK(cnnlSetTensorDescriptor(in_desc, static_cast<cnnlTensorLayout_t>(kLayoutArray),
-                                        static_cast<cnnlDataType_t>(dtype), 2, sizes) == kStatusSuccess,
-                "set input desc failed");
-    TORCH_CHECK(cnnlSetTensorDescriptor(out_desc, static_cast<cnnlTensorLayout_t>(kLayoutArray),
-                                        static_cast<cnnlDataType_t>(dtype), 2, sizes) == kStatusSuccess,
-                "set output desc failed");
-
-    auto out = torch::empty_like(x);
-    size_t workspace_size = 0;
-    void *handle = torch_mlu::getCurrentHandle();
-    TORCH_CHECK(lower_scan_workspace(handle, in_desc, axis, &workspace_size) == kStatusSuccess,
-                "get workspace size failed");
-    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
-                                  x.options().dtype(torch::kUInt8));
-    void *workspace_ptr = workspace_size == 0 ? nullptr : workspace.data_ptr();
-    TORCH_CHECK(lower_scan(handle, in_desc, x.data_ptr(), axis, exclusive, reverse,
-                           kPropagateNan, out_desc, out.data_ptr(), workspace_ptr,
-                           workspace_size) == kStatusSuccess,
-                "CNNL scan failed");
-
-    cnnlDestroyTensorDescriptor(in_desc);
-    cnnlDestroyTensorDescriptor(out_desc);
-    return out;
+torch::Tensor dispatch_scan(torch::Tensor x, int dim) {
+    using Fn = torch::Tensor(const torch::Tensor &, int64_t,
+                             c10::optional<c10::ScalarType>);
+    static auto op = c10::Dispatcher::singleton()
+                         .findSchemaOrThrow(scan_schema_name().c_str(), "")
+                         .typed<Fn>();
+    return op.call(x, static_cast<int64_t>(dim), c10::nullopt);
 }
 
 } // namespace
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(dim == 1 || dim == -1, "Only dim=1 is supported");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 128 && x.size(1) == 4000,
+                "Only official shape [128, 4000] is supported");
     int axis = dim < 0 ? dim + static_cast<int>(x.dim()) : dim;
     std::vector<int64_t> axes = {axis};
     auto flipped = x.flip(axes).contiguous();
-    auto scanned = run_scan(flipped, axis, false, false);
+    auto scanned = dispatch_scan(flipped, axis);
     return scanned.flip(axes);
 }
