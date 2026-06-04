@@ -22,7 +22,7 @@ __mlu_entry__ void binned_scatter_half_kernel(
     for (int idx = taskId; idx < total; idx += taskDim) {
         int h = idx % hidden_size;
         int token = idx / hidden_size;
-        float acc = 0.0f;
+        half acc = (half)0.0f;
         for (int expert = 0; expert < num_experts; ++expert) {
             int start = expert == 0 ? 0 : bins[expert - 1];
             int end = bins[expert];
@@ -33,15 +33,15 @@ __mlu_entry__ void binned_scatter_half_kernel(
             for (int slot = 0; slot < count; ++slot) {
                 int index_a = indices[start + slot];
                 if (index_a / top_k == token) {
-                    float v = (float)x[(expert * expert_capacity + slot) * hidden_size + h];
+                    half v = x[(expert * expert_capacity + slot) * hidden_size + h];
                     if (has_weights) {
-                        v *= (float)weights[index_a];
+                        v = v * weights[index_a];
                     }
-                    acc += v;
+                    acc = acc + v;
                 }
             }
         }
-        out[idx] = (half)acc;
+        out[idx] = acc;
     }
 }
 
