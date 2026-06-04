@@ -1,0 +1,9 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    TORCH_CHECK(x.dim() == 4 && x.size(1) == num_features, "Only NCHW BatchNorm2d input is supported");
+    auto mean = x.mean({0, 2, 3}, true);
+    auto centered = x.sub(mean);
+    auto var = centered.mul(centered).mean({0, 2, 3}, true);
+    return centered.div(var.add(1.0e-5).sqrt());
+}

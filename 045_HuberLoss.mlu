@@ -1,0 +1,7 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    auto abs_diff = predictions.sub(targets).abs();
+    auto excess = abs_diff.sub(1.0).clamp_min(0.0);
+    return abs_diff.mul(abs_diff).sub(excess.mul(excess)).mul(0.5).mean();
+}

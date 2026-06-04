@@ -1,0 +1,13 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int num_groups, int num_features) {
+    TORCH_CHECK(x.dim() == 4 && x.size(1) == num_features, "Only NCHW GroupNorm input is supported");
+    int64_t n = x.size(0);
+    int64_t h = x.size(2);
+    int64_t w = x.size(3);
+    auto grouped = x.view({n, num_groups, num_features / num_groups, h, w});
+    auto mean = grouped.mean({2, 3, 4}, true);
+    auto centered = grouped.sub(mean);
+    auto var = centered.mul(centered).mean({2, 3, 4}, true);
+    return centered.div(var.add(1.0e-5).sqrt()).view_as(x);
+}

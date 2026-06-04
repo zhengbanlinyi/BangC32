@@ -1,0 +1,5 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    return predictions.mul(targets).neg().add(1.0).clamp_min(0.0).mean();
+}

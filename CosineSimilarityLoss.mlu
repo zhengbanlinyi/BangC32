@@ -1,0 +1,9 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    auto dot = predictions.mul(targets).sum(1);
+    auto pred_norm = predictions.mul(predictions).sum(1).sqrt();
+    auto target_norm = targets.mul(targets).sum(1).sqrt();
+    auto cosine = dot.div(pred_norm.mul(target_norm).clamp_min(1.0e-12));
+    return cosine.neg().add(1.0).mean();
+}

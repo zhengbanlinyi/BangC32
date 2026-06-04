@@ -1,0 +1,10 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    auto maxv = std::get<0>(predictions.max(1, true));
+    auto shifted = predictions.sub(maxv);
+    auto log_denom = shifted.exp().sum(1).log().add(maxv.squeeze(1));
+    auto idx = targets.to(torch::kLong).view({-1, 1});
+    auto picked = predictions.gather(1, idx).squeeze(1);
+    return log_denom.sub(picked).mean();
+}
