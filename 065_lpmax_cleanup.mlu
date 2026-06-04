@@ -1,0 +1,62 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+
+__mlu_entry__ void row_nanmax_half_kernel(const half *input, half *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows) {
+        return;
+    }
+    bool seen = false;
+    float best = -INFINITY;
+    int64_t base = (int64_t)row * cols;
+    for (int c = 0; c < cols; ++c) {
+        float v = (float)input[base + c];
+        if (v == v) {
+            best = seen ? fmaxf(best, v) : v;
+            seen = true;
+        }
+    }
+    output[row] = seen ? (half)best : (half)NAN;
+}
+
+__mlu_entry__ void row_nanmax_float_kernel(const float *input, float *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows) {
+        return;
+    }
+    bool seen = false;
+    float best = -INFINITY;
+    int64_t base = (int64_t)row * cols;
+    for (int c = 0; c < cols; ++c) {
+        float v = input[base + c];
+        if (v == v) {
+            best = seen ? fmaxf(best, v) : v;
+            seen = true;
+        }
+    }
+    output[row] = seen ? best : NAN;
+}
+
+torch::Tensor bang_func(torch::Tensor output_per_tensor, int max_chunks_per_tensor) {
+    TORCH_CHECK(output_per_tensor.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(output_per_tensor.dim() == 2, "input must be 2D");
+    TORCH_CHECK(output_per_tensor.size(1) == max_chunks_per_tensor, "column count mismatch");
+    auto output = torch::empty({output_per_tensor.size(0)}, output_per_tensor.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {(unsigned int)output_per_tensor.size(0), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (output_per_tensor.scalar_type() == torch::kHalf) {
+        row_nanmax_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(output_per_tensor.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            output_per_tensor.size(0), max_chunks_per_tensor);
+    } else {
+        row_nanmax_float_kernel<<<grid, ktype, queue>>>(
+            output_per_tensor.data_ptr<float>(), output.data_ptr<float>(),
+            output_per_tensor.size(0), max_chunks_per_tensor);
+    }
+    return output;
+}

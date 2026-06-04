@@ -1,0 +1,79 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void adaptive_pool2d_nhwc_half_kernel(
+    const half *input, half *output, int64_t total,
+    int batch, int in_h, int in_w, int channels, int out_h, int out_w) {
+    int64_t stride = taskDim;
+    for (int64_t idx = taskId; idx < total; idx += stride) {
+        int c = idx % channels;
+        int64_t tmp = idx / channels;
+        int ow = tmp % out_w;
+        tmp /= out_w;
+        int oh = tmp % out_h;
+        int b = tmp / out_h;
+        int hs = (oh * in_h) / out_h;
+        int he = ((oh + 1) * in_h + out_h - 1) / out_h;
+        int ws = (ow * in_w) / out_w;
+        int we = ((ow + 1) * in_w + out_w - 1) / out_w;
+        float acc = 0.0f;
+        int count = (he - hs) * (we - ws);
+        for (int ih = hs; ih < he; ++ih) {
+            for (int iw = ws; iw < we; ++iw) {
+                int64_t in_idx = (((int64_t)b * in_h + ih) * in_w + iw) * channels + c;
+                acc += (float)input[in_idx];
+            }
+        }
+        output[idx] = (half)(acc / (float)count);
+    }
+}
+
+__mlu_entry__ void adaptive_pool2d_nhwc_float_kernel(
+    const float *input, float *output, int64_t total,
+    int batch, int in_h, int in_w, int channels, int out_h, int out_w) {
+    int64_t stride = taskDim;
+    for (int64_t idx = taskId; idx < total; idx += stride) {
+        int c = idx % channels;
+        int64_t tmp = idx / channels;
+        int ow = tmp % out_w;
+        tmp /= out_w;
+        int oh = tmp % out_h;
+        int b = tmp / out_h;
+        int hs = (oh * in_h) / out_h;
+        int he = ((oh + 1) * in_h + out_h - 1) / out_h;
+        int ws = (ow * in_w) / out_w;
+        int we = ((ow + 1) * in_w + out_w - 1) / out_w;
+        float acc = 0.0f;
+        int count = (he - hs) * (we - ws);
+        for (int ih = hs; ih < he; ++ih) {
+            for (int iw = ws; iw < we; ++iw) {
+                int64_t in_idx = (((int64_t)b * in_h + ih) * in_w + iw) * channels + c;
+                acc += input[in_idx];
+            }
+        }
+        output[idx] = acc / (float)count;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, int osizeH, int osizeW) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == 4, "input must be NHWC");
+    auto output = torch::empty({input.size(0), osizeH, osizeW, input.size(3)}, input.options());
+    int64_t total = output.numel();
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (input.scalar_type() == torch::kHalf) {
+        adaptive_pool2d_nhwc_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()), total,
+            input.size(0), input.size(1), input.size(2), input.size(3), osizeH, osizeW);
+    } else {
+        adaptive_pool2d_nhwc_float_kernel<<<grid, ktype, queue>>>(
+            input.data_ptr<float>(), output.data_ptr<float>(), total,
+            input.size(0), input.size(1), input.size(2), input.size(3), osizeH, osizeW);
+    }
+    return output;
+}
