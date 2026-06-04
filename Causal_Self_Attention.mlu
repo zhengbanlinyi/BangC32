@@ -1,0 +1,48 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>
+
+__mlu_entry__ void apply_causal_mask_kernel(float *scores, int seq) {
+    int total = seq * seq;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int i = idx / seq;
+        int j = idx - i * seq;
+        if (j > i) {
+            scores[idx] = -3.4028234663852886e38f;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    auto qc = q.contiguous();
+    auto kc = k.contiguous();
+    auto vc = v.contiguous();
+    TORCH_CHECK(qc.dim() == 4, "expected q shape [batch, head, seq, dim]");
+    int batch = (int)qc.size(0);
+    int heads = (int)qc.size(1);
+    int seq = (int)qc.size(2);
+    int dim = (int)qc.size(3);
+    double denom = std::sqrt((double)dim);
+
+    auto output = torch::empty_like(qc);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {256, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            auto q2 = qc.select(0, b).select(0, h).to(torch::kFloat);
+            auto k2 = kc.select(0, b).select(0, h).to(torch::kFloat);
+            auto v2 = vc.select(0, b).select(0, h).to(torch::kFloat);
+            auto scores = q2.mm(k2.transpose(0, 1)) / denom;
+            apply_causal_mask_kernel<<<grid, ktype, queue>>>(scores.data_ptr<float>(), seq);
+            auto row_max = std::get<0>(scores.max(1, true));
+            auto ex = (scores - row_max).exp();
+            auto probs = ex / ex.sum(1, true);
+            auto part = probs.mm(v2);
+            output.select(0, b).select(0, h).copy_(part.to(qc.scalar_type()));
+        }
+    }
+    return output;
+}
