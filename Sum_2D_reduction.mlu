@@ -18,7 +18,7 @@ __mlu_entry__ void plane_total_float_kernel(const float *input, float *output) {
     output[b] = __bang_sum(data, R081_PLANE);
 }
 
-__mlu_entry__ void plane_total_half_kernel(const half *input, half *output) {
+__mlu_entry__ void plane_total_half_kernel(const half *input, float *output) {
     int b = taskId;
     if (b >= R081_B) {
         return;
@@ -27,21 +27,21 @@ __mlu_entry__ void plane_total_half_kernel(const half *input, half *output) {
     __nram__ float data[R081_PLANE];
     __memcpy(half_buf, input + (int64_t)b * R081_PLANE, R081_PLANE * sizeof(half), GDRAM2NRAM);
     __bang_half2float(data, half_buf, R081_PLANE);
-    output[b] = (half)__bang_sum(data, R081_PLANE);
+    output[b] = __bang_sum(data, R081_PLANE);
 }
 
 torch::Tensor bang_func(torch::Tensor x) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(x.dim() == 3 && x.size(0) == R081_B && x.size(1) == 256 && x.size(2) == 256,
                 "Only shape [16, 256, 256] is supported");
-    auto output = torch::empty({x.size(0)}, x.options());
+    auto output = torch::empty({x.size(0)}, x.options().dtype(torch::kFloat));
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {R081_B, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     if (x.scalar_type() == torch::kHalf) {
         plane_total_half_kernel<<<grid, ktype, queue>>>(
             reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+            output.data_ptr<float>());
         return output;
     }
     plane_total_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>());

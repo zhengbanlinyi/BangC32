@@ -38,12 +38,12 @@ __mlu_entry__ void final_total_float_kernel(const float *partial, float *output)
     output[0] = s;
 }
 
-__mlu_entry__ void final_total_half_kernel(const float *partial, half *output) {
+__mlu_entry__ void final_total_half_kernel(const float *partial, float *output) {
     float s = 0.0f;
     for (int i = 0; i < R079_ROWS; ++i) {
         s += partial[i];
     }
-    output[0] = (half)s;
+    output[0] = s;
 }
 
 torch::Tensor bang_func(torch::Tensor x) {
@@ -51,7 +51,7 @@ torch::Tensor bang_func(torch::Tensor x) {
     TORCH_CHECK(x.dim() == 2 && x.size(0) == R079_ROWS && x.size(1) == R079_COLS,
                 "Only shape [64, 8192] is supported");
     auto partial = torch::empty({R079_ROWS}, x.options().dtype(torch::kFloat));
-    auto output = torch::empty({}, x.options());
+    auto output = torch::empty({}, x.options().dtype(torch::kFloat));
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_rows = {R079_ROWS, 1, 1};
     cnrtDim3_t grid_one = {1, 1, 1};
@@ -60,7 +60,7 @@ torch::Tensor bang_func(torch::Tensor x) {
         row_total_half_kernel<<<grid_rows, ktype, queue>>>(
             reinterpret_cast<const half *>(x.data_ptr<at::Half>()), partial.data_ptr<float>());
         final_total_half_kernel<<<grid_one, ktype, queue>>>(
-            partial.data_ptr<float>(), reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+            partial.data_ptr<float>(), output.data_ptr<float>());
         return output;
     }
     row_total_float_kernel<<<grid_rows, ktype, queue>>>(x.data_ptr<float>(), partial.data_ptr<float>());
