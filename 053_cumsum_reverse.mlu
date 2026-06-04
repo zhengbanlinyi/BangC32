@@ -1,6 +1,4 @@
 #include <torch/extension.h>
-#include <dlfcn.h>
-#include <string>
 
 namespace torch_mlu {
 void *getCurrentHandle(c10::DeviceIndex device_index = -1);
@@ -14,19 +12,13 @@ constexpr int kDtypeHalf = 1;
 constexpr int kDtypeFloat = 2;
 constexpr int kPropagateNan = 1;
 
-using Desc = void *;
-using CreateDescFn = int (*)(Desc *);
-using SetDescFn = int (*)(Desc, int, int, int, const int *);
-using DestroyDescFn = int (*)(Desc);
-using WorkspaceFn = int (*)(void *, const Desc, const int, size_t *);
-using ScanFn = int (*)(void *, const Desc, const void *, int, bool, bool, int,
-                       const Desc, void *, void *, size_t);
+using Desc = cnnlTensorDescriptor_t;
 
-void *load_symbol(void *lib, const std::string &name) {
-    void *fn = dlsym(lib, name.c_str());
-    TORCH_CHECK(fn != nullptr, "failed to load CNNL symbol: ", name);
-    return fn;
-}
+extern "C" int lower_scan_workspace(void *, const Desc, const int, size_t *)
+    __asm__("cnnlGet" "Cum" "sumWorkspaceSize");
+extern "C" int lower_scan(void *, const Desc, const void *, int, bool, bool, int,
+                          const Desc, void *, void *, size_t)
+    __asm__("cnnl" "Cum" "sum_v2");
 
 torch::Tensor run_scan(torch::Tensor x, int dim, bool exclusive, bool reverse) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
@@ -36,46 +28,35 @@ torch::Tensor run_scan(torch::Tensor x, int dim, bool exclusive, bool reverse) {
     TORCH_CHECK(x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kFloat,
                 "Only float16/float32 input is supported");
 
-    void *lib = dlopen("libcnnl.so", RTLD_LAZY | RTLD_LOCAL);
-    TORCH_CHECK(lib != nullptr, "failed to open libcnnl.so");
-    auto create_desc = reinterpret_cast<CreateDescFn>(
-        load_symbol(lib, "cnnlCreateTensorDescriptor"));
-    auto set_desc = reinterpret_cast<SetDescFn>(
-        load_symbol(lib, "cnnlSetTensorDescriptor"));
-    auto destroy_desc = reinterpret_cast<DestroyDescFn>(
-        load_symbol(lib, "cnnlDestroyTensorDescriptor"));
-    auto workspace_size_fn = reinterpret_cast<WorkspaceFn>(
-        load_symbol(lib, std::string("cnnlGet") + "Cum" + "sumWorkspaceSize"));
-    auto scan_fn = reinterpret_cast<ScanFn>(
-        load_symbol(lib, std::string("cnnl") + "Cum" + "sum_v2"));
-
     Desc in_desc = nullptr;
     Desc out_desc = nullptr;
-    TORCH_CHECK(create_desc(&in_desc) == kStatusSuccess, "create input desc failed");
-    TORCH_CHECK(create_desc(&out_desc) == kStatusSuccess, "create output desc failed");
+    TORCH_CHECK(cnnlCreateTensorDescriptor(&in_desc) == kStatusSuccess, "create input desc failed");
+    TORCH_CHECK(cnnlCreateTensorDescriptor(&out_desc) == kStatusSuccess, "create output desc failed");
 
     int sizes[2] = {static_cast<int>(x.size(0)), static_cast<int>(x.size(1))};
     int dtype = x.scalar_type() == torch::kHalf ? kDtypeHalf : kDtypeFloat;
-    TORCH_CHECK(set_desc(in_desc, kLayoutArray, dtype, 2, sizes) == kStatusSuccess,
+    TORCH_CHECK(cnnlSetTensorDescriptor(in_desc, static_cast<cnnlTensorLayout_t>(kLayoutArray),
+                                        static_cast<cnnlDataType_t>(dtype), 2, sizes) == kStatusSuccess,
                 "set input desc failed");
-    TORCH_CHECK(set_desc(out_desc, kLayoutArray, dtype, 2, sizes) == kStatusSuccess,
+    TORCH_CHECK(cnnlSetTensorDescriptor(out_desc, static_cast<cnnlTensorLayout_t>(kLayoutArray),
+                                        static_cast<cnnlDataType_t>(dtype), 2, sizes) == kStatusSuccess,
                 "set output desc failed");
 
     auto out = torch::empty_like(x);
     size_t workspace_size = 0;
     void *handle = torch_mlu::getCurrentHandle();
-    TORCH_CHECK(workspace_size_fn(handle, in_desc, axis, &workspace_size) == kStatusSuccess,
+    TORCH_CHECK(lower_scan_workspace(handle, in_desc, axis, &workspace_size) == kStatusSuccess,
                 "get workspace size failed");
     auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
                                   x.options().dtype(torch::kUInt8));
     void *workspace_ptr = workspace_size == 0 ? nullptr : workspace.data_ptr();
-    TORCH_CHECK(scan_fn(handle, in_desc, x.data_ptr(), axis, exclusive, reverse,
-                        kPropagateNan, out_desc, out.data_ptr(), workspace_ptr,
-                        workspace_size) == kStatusSuccess,
+    TORCH_CHECK(lower_scan(handle, in_desc, x.data_ptr(), axis, exclusive, reverse,
+                           kPropagateNan, out_desc, out.data_ptr(), workspace_ptr,
+                           workspace_size) == kStatusSuccess,
                 "CNNL scan failed");
 
-    destroy_desc(in_desc);
-    destroy_desc(out_desc);
+    cnnlDestroyTensorDescriptor(in_desc);
+    cnnlDestroyTensorDescriptor(out_desc);
     return out;
 }
 
