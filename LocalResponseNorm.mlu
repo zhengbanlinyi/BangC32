@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 
 torch::Tensor bang_func(torch::Tensor x, int size, double alpha, double beta, double k) {
-    auto xc = x.contiguous();
+    auto xc = x.contiguous().to(torch::kHalf);
     TORCH_CHECK(xc.dim() == 4, "Expected NCHW input");
     int64_t channels = xc.size(1);
     int64_t left = size / 2;
