@@ -1,0 +1,9 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, int64_t dim, double eps) {
+    auto y = x.contiguous() + residual.contiguous();
+    auto flat = y.view({-1, dim});
+    auto mean_sq = flat.mul(flat).mean(1, true);
+    auto normed = flat / mean_sq.add(eps).sqrt();
+    return (normed * weight.contiguous().view({1, dim})).view_as(y);
+}
