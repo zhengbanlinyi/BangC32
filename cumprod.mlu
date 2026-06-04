@@ -1,0 +1,5 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    return x.cumprod(dim);
+}

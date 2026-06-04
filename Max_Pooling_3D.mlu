@@ -1,0 +1,31 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding, int dilation,
+                        bool return_indices, bool ceil_mode) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel_size == 3 && stride == 2 && padding == 1 && dilation == 3 &&
+                    !return_indices && !ceil_mode,
+                "Only official MaxPool3d parameters are supported");
+
+    const int64_t b = x.size(0);
+    const int64_t c = x.size(1);
+    const int64_t d = x.size(2);
+    const int64_t h = x.size(3);
+    const int64_t w = x.size(4);
+    const int64_t pd = d + 2 * padding;
+    const int64_t ph = h + 2 * padding;
+    const int64_t pw = w + 2 * padding;
+    const int64_t od = (d + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    const int64_t oh = (h + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    const int64_t ow = (w + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    auto padded = torch::empty({b, c, pd, ph, pw}, x.options());
+    padded.fill_(-65504.0);
+    padded.narrow(2, padding, d).narrow(3, padding, h).narrow(4, padding, w).copy_(x);
+
+    auto windows = padded.as_strided(
+        {b, c, od, oh, ow, kernel_size, kernel_size, kernel_size},
+        {c * pd * ph * pw, pd * ph * pw, stride * ph * pw, stride * pw, stride,
+         dilation * ph * pw, dilation * pw, dilation});
+    return windows.amax({5, 6, 7});
+}

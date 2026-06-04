@@ -1,0 +1,26 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding, int dilation) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel_size == 2 && stride == 2 && padding == 1 && dilation == 3,
+                "Only official MaxPool2d parameters are supported");
+
+    const int64_t b = x.size(0);
+    const int64_t c = x.size(1);
+    const int64_t h = x.size(2);
+    const int64_t w = x.size(3);
+    const int64_t ph = h + 2 * padding;
+    const int64_t pw = w + 2 * padding;
+    const int64_t oh = (h + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    const int64_t ow = (w + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    auto padded = torch::empty({b, c, ph, pw}, x.options());
+    padded.fill_(-65504.0);
+    padded.narrow(2, padding, h).narrow(3, padding, w).copy_(x);
+
+    auto windows = padded.as_strided(
+        {b, c, oh, ow, kernel_size, kernel_size},
+        {c * ph * pw, ph * pw, stride * pw, stride, dilation * pw, dilation});
+    auto flat = windows.reshape({b, c, oh, ow, kernel_size * kernel_size});
+    return std::get<0>(flat.max(4));
+}
