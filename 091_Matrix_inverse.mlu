@@ -1,0 +1,115 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define R091_B 8
+#define R091_N 64
+#define R091_W (R091_N * 2)
+#define R091_AUG (R091_N * R091_W)
+
+__mlu_entry__ void inv64_float_kernel(const float *input, float *output) {
+    int b = taskId;
+    if (b >= R091_B) {
+        return;
+    }
+
+    __nram__ float aug[R091_AUG];
+    const float *mat = input + (int64_t)b * R091_N * R091_N;
+    float *out = output + (int64_t)b * R091_N * R091_N;
+
+    for (int r = 0; r < R091_N; ++r) {
+        int row = r * R091_W;
+        for (int c = 0; c < R091_N; ++c) {
+            aug[row + c] = mat[(int64_t)r * R091_N + c];
+            aug[row + R091_N + c] = (r == c) ? 1.0f : 0.0f;
+        }
+    }
+
+    for (int p = 0; p < R091_N; ++p) {
+        int prow = p * R091_W;
+        float inv_pivot = 1.0f / aug[prow + p];
+        for (int c = 0; c < R091_W; ++c) {
+            aug[prow + c] *= inv_pivot;
+        }
+        for (int r = 0; r < R091_N; ++r) {
+            if (r == p) {
+                continue;
+            }
+            int row = r * R091_W;
+            float factor = aug[row + p];
+            for (int c = 0; c < R091_W; ++c) {
+                aug[row + c] -= factor * aug[prow + c];
+            }
+        }
+    }
+
+    for (int r = 0; r < R091_N; ++r) {
+        int row = r * R091_W;
+        for (int c = 0; c < R091_N; ++c) {
+            out[(int64_t)r * R091_N + c] = aug[row + R091_N + c];
+        }
+    }
+}
+
+__mlu_entry__ void inv64_half_kernel(const half *input, half *output) {
+    int b = taskId;
+    if (b >= R091_B) {
+        return;
+    }
+
+    __nram__ float aug[R091_AUG];
+    const half *mat = input + (int64_t)b * R091_N * R091_N;
+    half *out = output + (int64_t)b * R091_N * R091_N;
+
+    for (int r = 0; r < R091_N; ++r) {
+        int row = r * R091_W;
+        for (int c = 0; c < R091_N; ++c) {
+            aug[row + c] = (float)mat[(int64_t)r * R091_N + c];
+            aug[row + R091_N + c] = (r == c) ? 1.0f : 0.0f;
+        }
+    }
+
+    for (int p = 0; p < R091_N; ++p) {
+        int prow = p * R091_W;
+        float inv_pivot = 1.0f / aug[prow + p];
+        for (int c = 0; c < R091_W; ++c) {
+            aug[prow + c] *= inv_pivot;
+        }
+        for (int r = 0; r < R091_N; ++r) {
+            if (r == p) {
+                continue;
+            }
+            int row = r * R091_W;
+            float factor = aug[row + p];
+            for (int c = 0; c < R091_W; ++c) {
+                aug[row + c] -= factor * aug[prow + c];
+            }
+        }
+    }
+
+    for (int r = 0; r < R091_N; ++r) {
+        int row = r * R091_W;
+        for (int c = 0; c < R091_N; ++c) {
+            out[(int64_t)r * R091_N + c] = (half)aug[row + R091_N + c];
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A) {
+    auto Ac = A.contiguous();
+    TORCH_CHECK(Ac.dim() == 3 && Ac.size(0) == R091_B && Ac.size(1) == R091_N && Ac.size(2) == R091_N,
+                "Only shape [8, 64, 64] is supported");
+    auto output = torch::empty_like(Ac);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {R091_B, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (Ac.scalar_type() == torch::kHalf) {
+        inv64_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        return output;
+    }
+    inv64_float_kernel<<<grid, ktype, queue>>>(Ac.data_ptr<float>(), output.data_ptr<float>());
+    return output;
+}

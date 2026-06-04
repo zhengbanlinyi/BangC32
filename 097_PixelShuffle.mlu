@@ -1,0 +1,15 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int upscale_factor) {
+    auto xc = x.contiguous();
+    TORCH_CHECK(upscale_factor == 2, "Only upscale_factor=2 is supported");
+    TORCH_CHECK(xc.dim() == 4 && xc.size(1) % 4 == 0, "Expected NCHW input with channels divisible by 4");
+    int64_t n = xc.size(0);
+    int64_t c = xc.size(1) / 4;
+    int64_t h = xc.size(2);
+    int64_t w = xc.size(3);
+    return xc.view({n, c, 2, 2, h, w})
+        .permute({0, 1, 4, 2, 5, 3})
+        .contiguous()
+        .view({n, c, h * 2, w * 2});
+}

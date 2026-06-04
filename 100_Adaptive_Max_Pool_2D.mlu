@@ -1,0 +1,15 @@
+#include <torch/extension.h>
+#include <vector>
+
+torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
+    auto xc = x.contiguous();
+    TORCH_CHECK(output_size.size() == 2 && output_size[0] == 8 && output_size[1] == 8,
+                "Only output_size [8, 8] is supported");
+    TORCH_CHECK(xc.dim() == 4 && xc.size(2) == 256 && xc.size(3) == 256,
+                "Only NCHW inputs with 256x256 spatial size are supported");
+    int64_t n = xc.size(0);
+    int64_t c = xc.size(1);
+    auto blocks = xc.view({n, c, 8, 32, 8, 32});
+    auto width_max = std::get<0>(blocks.max(5));
+    return std::get<0>(width_max.max(3)).contiguous();
+}

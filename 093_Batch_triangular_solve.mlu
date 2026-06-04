@@ -1,0 +1,69 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define R093_B 8
+#define R093_N 64
+
+__mlu_entry__ void tri_solve_float_kernel(const float *A, const float *rhs, float *out) {
+    int b = taskId;
+    if (b >= R093_B) {
+        return;
+    }
+    const float *mat = A + (int64_t)b * R093_N * R093_N;
+    const float *vec = rhs + (int64_t)b * R093_N;
+    float *dst = out + (int64_t)b * R093_N;
+
+    for (int i = R093_N - 1; i >= 0; --i) {
+        float s = vec[i];
+        for (int j = i + 1; j < R093_N; ++j) {
+            s -= mat[(int64_t)i * R093_N + j] * dst[j];
+        }
+        dst[i] = s / mat[(int64_t)i * R093_N + i];
+    }
+}
+
+__mlu_entry__ void tri_solve_half_kernel(const half *A, const half *rhs, half *out) {
+    int b = taskId;
+    if (b >= R093_B) {
+        return;
+    }
+    const half *mat = A + (int64_t)b * R093_N * R093_N;
+    const half *vec = rhs + (int64_t)b * R093_N;
+    half *dst = out + (int64_t)b * R093_N;
+    __nram__ float work[R093_N];
+
+    for (int i = R093_N - 1; i >= 0; --i) {
+        float s = (float)vec[i];
+        for (int j = i + 1; j < R093_N; ++j) {
+            s -= (float)mat[(int64_t)i * R093_N + j] * work[j];
+        }
+        work[i] = s / (float)mat[(int64_t)i * R093_N + i];
+    }
+    for (int i = 0; i < R093_N; ++i) {
+        dst[i] = (half)work[i];
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor b) {
+    auto Ac = A.contiguous();
+    auto bc = b.contiguous();
+    TORCH_CHECK(Ac.dim() == 3 && Ac.size(0) == R093_B && Ac.size(1) == R093_N && Ac.size(2) == R093_N,
+                "Only A shape [8, 64, 64] is supported");
+    TORCH_CHECK(bc.dim() == 3 && bc.size(0) == R093_B && bc.size(1) == R093_N && bc.size(2) == 1,
+                "Only b shape [8, 64, 1] is supported");
+    auto output = torch::empty_like(bc);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {R093_B, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (Ac.scalar_type() == torch::kHalf) {
+        tri_solve_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(bc.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        return output;
+    }
+    tri_solve_float_kernel<<<grid, ktype, queue>>>(Ac.data_ptr<float>(), bc.data_ptr<float>(), output.data_ptr<float>());
+    return output;
+}
