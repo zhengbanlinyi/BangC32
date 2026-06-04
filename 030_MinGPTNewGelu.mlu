@@ -4,125 +4,118 @@
 #include <stdint.h>
 
 #define POINTWISE_CHUNK 16384
-#define POINTWISE_TASKS 16
+#define POINTWISE_TASKS 512
 #define GELU_C 0.7978845608028654f
 #define GELU_K 0.044715f
 
 __mlu_entry__ void new_gelu_float_kernel(
     const float *input,
     float *output,
-    int per_task,
-    int remainder) {
-
-    uint32_t task_id = taskId;
-    uint32_t start = task_id * per_task +
-                     (task_id < (uint32_t)remainder ? task_id : (uint32_t)remainder);
-    uint32_t count = per_task +
-                     (task_id < (uint32_t)remainder ? 1 : 0);
+    int total) {
 
     __nram__ float nram_x[POINTWISE_CHUNK];
-    __nram__ float nram_exp[POINTWISE_CHUNK];
+    __nram__ float nram_tmp[POINTWISE_CHUNK];
+    __nram__ float nram_act[POINTWISE_CHUNK];
 
-    for (uint32_t offset = 0; offset < count; offset += POINTWISE_CHUNK) {
-        uint32_t len = (offset + POINTWISE_CHUNK <= count)
+    for (uint32_t base = taskId * POINTWISE_CHUNK; base < (uint32_t)total; base += taskDim * POINTWISE_CHUNK) {
+        uint32_t len = (base + POINTWISE_CHUNK <= (uint32_t)total)
                            ? POINTWISE_CHUNK
-                           : (count - offset);
+                           : ((uint32_t)total - base);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(nram_x, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_x, input + base, len * sizeof(float), GDRAM2NRAM);
 
-        for (uint32_t i = 0; i < len; ++i) {
-            float v = nram_x[i];
-            float z = GELU_C * (v + GELU_K * v * v * v);
-            nram_exp[i] = -2.0f * z;
-        }
+        __bang_mul(nram_tmp, nram_x, nram_x, aligned_len);
+        __bang_mul(nram_tmp, nram_tmp, nram_x, aligned_len);
+        __bang_mul_scalar(nram_tmp, nram_tmp, GELU_K, aligned_len);
+        __bang_add(nram_act, nram_x, nram_tmp, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, GELU_C, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, -2.0f, aligned_len);
+        __bang_active_exphp(nram_act, nram_act, aligned_len);
+        __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_recip(nram_act, nram_act, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, 2.0f, aligned_len);
+        __bang_sub_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_mul(nram_x, nram_x, nram_act, aligned_len);
+        __bang_mul_scalar(nram_x, nram_x, 0.5f, aligned_len);
 
-        __bang_active_exphp(nram_exp, nram_exp, aligned_len);
-
-        for (uint32_t i = 0; i < len; ++i) {
-            float v = nram_x[i];
-            float tanh_z = 2.0f / (1.0f + nram_exp[i]) - 1.0f;
-            nram_x[i] = 0.5f * v * (1.0f + tanh_z);
-        }
-
-        __memcpy(output + start + offset, nram_x, len * sizeof(float), NRAM2GDRAM);
+        __memcpy(output + base, nram_x, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
 __mlu_entry__ void new_gelu_half_kernel(
     const half *input,
     half *output,
-    int per_task,
-    int remainder) {
-
-    uint32_t task_id = taskId;
-    uint32_t start = task_id * per_task +
-                     (task_id < (uint32_t)remainder ? task_id : (uint32_t)remainder);
-    uint32_t count = per_task +
-                     (task_id < (uint32_t)remainder ? 1 : 0);
+    int total) {
 
     __nram__ half nram_half[POINTWISE_CHUNK];
     __nram__ float nram_x[POINTWISE_CHUNK];
-    __nram__ float nram_exp[POINTWISE_CHUNK];
+    __nram__ float nram_tmp[POINTWISE_CHUNK];
+    __nram__ float nram_act[POINTWISE_CHUNK];
 
-    for (uint32_t offset = 0; offset < count; offset += POINTWISE_CHUNK) {
-        uint32_t len = (offset + POINTWISE_CHUNK <= count)
+    for (uint32_t base = taskId * POINTWISE_CHUNK; base < (uint32_t)total; base += taskDim * POINTWISE_CHUNK) {
+        uint32_t len = (base + POINTWISE_CHUNK <= (uint32_t)total)
                            ? POINTWISE_CHUNK
-                           : (count - offset);
+                           : ((uint32_t)total - base);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(nram_half, input + start + offset, len * sizeof(half), GDRAM2NRAM);
+        __memcpy(nram_half, input + base, len * sizeof(half), GDRAM2NRAM);
         __bang_half2float(nram_x, nram_half, aligned_len);
 
-        for (uint32_t i = 0; i < len; ++i) {
-            float v = nram_x[i];
-            float z = GELU_C * (v + GELU_K * v * v * v);
-            nram_exp[i] = -2.0f * z;
-        }
-
-        __bang_active_exphp(nram_exp, nram_exp, aligned_len);
-
-        for (uint32_t i = 0; i < len; ++i) {
-            float v = nram_x[i];
-            float tanh_z = 2.0f / (1.0f + nram_exp[i]) - 1.0f;
-            nram_x[i] = 0.5f * v * (1.0f + tanh_z);
-        }
+        __bang_mul(nram_tmp, nram_x, nram_x, aligned_len);
+        __bang_mul(nram_tmp, nram_tmp, nram_x, aligned_len);
+        __bang_mul_scalar(nram_tmp, nram_tmp, GELU_K, aligned_len);
+        __bang_add(nram_act, nram_x, nram_tmp, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, GELU_C, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, -2.0f, aligned_len);
+        __bang_active_exphp(nram_act, nram_act, aligned_len);
+        __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_recip(nram_act, nram_act, aligned_len);
+        __bang_mul_scalar(nram_act, nram_act, 2.0f, aligned_len);
+        __bang_sub_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_mul(nram_x, nram_x, nram_act, aligned_len);
+        __bang_mul_scalar(nram_x, nram_x, 0.5f, aligned_len);
 
         __bang_float2half_rd(nram_half, nram_x, aligned_len);
-        __memcpy(output + start + offset, nram_half, len * sizeof(half), NRAM2GDRAM);
+        __memcpy(output + base, nram_half, len * sizeof(half), NRAM2GDRAM);
     }
 }
 
-static inline void split_work(int total, int *per_task, int *remainder) {
-    *per_task = total / POINTWISE_TASKS;
-    *remainder = total - (*per_task) * POINTWISE_TASKS;
+static inline int pointwise_tasks(int total) {
+    int tasks = (total + POINTWISE_CHUNK - 1) / POINTWISE_CHUNK;
+    if (tasks < 1) {
+        tasks = 1;
+    }
+    if (tasks > POINTWISE_TASKS) {
+        tasks = POINTWISE_TASKS;
+    }
+    return tasks;
 }
 
 torch::Tensor bang_func(torch::Tensor x) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
 
     auto output = torch::empty_like(x);
-    int per_task = 0;
-    int remainder = 0;
-    split_work((int)x.numel(), &per_task, &remainder);
+    int total = (int)x.numel();
+    int tasks = pointwise_tasks(total);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {POINTWISE_TASKS, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtDim3_t dim = {(unsigned int)tasks, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (x.scalar_type() == torch::kHalf) {
         new_gelu_half_kernel<<<dim, ktype, queue>>>(
             reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
             reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-            per_task,
-            remainder);
+            total);
         return output;
     }
 
     new_gelu_float_kernel<<<dim, ktype, queue>>>(
         x.data_ptr<float>(),
         output.data_ptr<float>(),
-        per_task,
-        remainder);
+        total);
     return output;
 }
