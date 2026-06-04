@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 
 torch::Tensor bang_func(torch::Tensor x) {
-    return x.abs().pow(0.5);
+    auto magnitude = x.clamp_min(0) - x.clamp_max(0);
+    return magnitude.log().mul(0.5).exp();
 }
