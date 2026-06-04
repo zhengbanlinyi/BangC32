@@ -1,0 +1,24 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void prefix_i32_to_i64_kernel(const int32_t *input, int64_t *output, int64_t n) {
+    int64_t acc = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        acc += (int64_t)input[i];
+        output[i] = acc;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor agg) {
+    TORCH_CHECK(agg.is_contiguous(), "agg must be contiguous");
+    TORCH_CHECK(agg.scalar_type() == torch::kInt32, "agg must be int32");
+    auto output = torch::empty({agg.numel()}, agg.options().dtype(torch::kLong));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    prefix_i32_to_i64_kernel<<<grid, ktype, queue>>>(
+        agg.data_ptr<int32_t>(), output.data_ptr<int64_t>(), agg.numel());
+    return output;
+}

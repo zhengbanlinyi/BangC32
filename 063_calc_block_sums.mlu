@@ -1,0 +1,63 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+constexpr int kBlockThreads = 128;
+constexpr int kItemsPerThread = 4;
+
+__mlu_entry__ void block_sums_half_kernel(const half *input, half *output, int64_t n, int elems_per_block, int num_blocks) {
+    int block = taskId;
+    if (block >= num_blocks) {
+        return;
+    }
+    int64_t start = (int64_t)block * elems_per_block;
+    int64_t end = start + elems_per_block;
+    if (end > n) {
+        end = n;
+    }
+    float acc = 0.0f;
+    for (int64_t i = start; i < end; ++i) {
+        acc += (float)input[i];
+    }
+    output[block] = (half)acc;
+}
+
+__mlu_entry__ void block_sums_float_kernel(const float *input, float *output, int64_t n, int elems_per_block, int num_blocks) {
+    int block = taskId;
+    if (block >= num_blocks) {
+        return;
+    }
+    int64_t start = (int64_t)block * elems_per_block;
+    int64_t end = start + elems_per_block;
+    if (end > n) {
+        end = n;
+    }
+    float acc = 0.0f;
+    for (int64_t i = start; i < end; ++i) {
+        acc += input[i];
+    }
+    output[block] = acc;
+}
+
+torch::Tensor bang_func(torch::Tensor input, int iters_per_cta) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    int elems_per_block = kBlockThreads * kItemsPerThread * iters_per_cta;
+    int64_t n = input.numel();
+    int num_blocks = (int)((n + elems_per_block - 1) / elems_per_block);
+    auto output = torch::empty({num_blocks}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {(unsigned int)num_blocks, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (input.scalar_type() == torch::kHalf) {
+        block_sums_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            n, elems_per_block, num_blocks);
+    } else {
+        block_sums_float_kernel<<<grid, ktype, queue>>>(
+            input.data_ptr<float>(), output.data_ptr<float>(),
+            n, elems_per_block, num_blocks);
+    }
+    return output;
+}

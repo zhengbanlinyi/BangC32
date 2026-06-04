@@ -1,0 +1,99 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void adaptive_pool3d_half_kernel(
+    const half *input, half *output, int64_t total,
+    int n_size, int c_size, int t_size, int h_size, int w_size,
+    int out_t, int out_h, int out_w) {
+    int64_t stride = taskDim;
+    for (int64_t idx = taskId; idx < total; idx += stride) {
+        int ow = idx % out_w;
+        int64_t tmp = idx / out_w;
+        int oh = tmp % out_h;
+        tmp /= out_h;
+        int ot = tmp % out_t;
+        tmp /= out_t;
+        int c = tmp % c_size;
+        int n = tmp / c_size;
+
+        int ts = (ot * t_size) / out_t;
+        int te = ((ot + 1) * t_size + out_t - 1) / out_t;
+        int hs = (oh * h_size) / out_h;
+        int he = ((oh + 1) * h_size + out_h - 1) / out_h;
+        int ws = (ow * w_size) / out_w;
+        int we = ((ow + 1) * w_size + out_w - 1) / out_w;
+
+        float acc = 0.0f;
+        int count = (te - ts) * (he - hs) * (we - ws);
+        for (int it = ts; it < te; ++it) {
+            for (int ih = hs; ih < he; ++ih) {
+                for (int iw = ws; iw < we; ++iw) {
+                    int64_t in_idx = (((((int64_t)n * c_size + c) * t_size + it) * h_size + ih) * w_size + iw);
+                    acc += (float)input[in_idx];
+                }
+            }
+        }
+        output[idx] = (half)(acc / (float)count);
+    }
+}
+
+__mlu_entry__ void adaptive_pool3d_float_kernel(
+    const float *input, float *output, int64_t total,
+    int n_size, int c_size, int t_size, int h_size, int w_size,
+    int out_t, int out_h, int out_w) {
+    int64_t stride = taskDim;
+    for (int64_t idx = taskId; idx < total; idx += stride) {
+        int ow = idx % out_w;
+        int64_t tmp = idx / out_w;
+        int oh = tmp % out_h;
+        tmp /= out_h;
+        int ot = tmp % out_t;
+        tmp /= out_t;
+        int c = tmp % c_size;
+        int n = tmp / c_size;
+
+        int ts = (ot * t_size) / out_t;
+        int te = ((ot + 1) * t_size + out_t - 1) / out_t;
+        int hs = (oh * h_size) / out_h;
+        int he = ((oh + 1) * h_size + out_h - 1) / out_h;
+        int ws = (ow * w_size) / out_w;
+        int we = ((ow + 1) * w_size + out_w - 1) / out_w;
+
+        float acc = 0.0f;
+        int count = (te - ts) * (he - hs) * (we - ws);
+        for (int it = ts; it < te; ++it) {
+            for (int ih = hs; ih < he; ++ih) {
+                for (int iw = ws; iw < we; ++iw) {
+                    int64_t in_idx = (((((int64_t)n * c_size + c) * t_size + it) * h_size + ih) * w_size + iw);
+                    acc += input[in_idx];
+                }
+            }
+        }
+        output[idx] = acc / (float)count;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, int osizeT, int osizeH, int osizeW) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == 5, "input must be 5D");
+    auto output = torch::empty({input.size(0), input.size(1), osizeT, osizeH, osizeW}, input.options());
+    int64_t total = output.numel();
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (input.scalar_type() == torch::kHalf) {
+        adaptive_pool3d_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()), total,
+            input.size(0), input.size(1), input.size(2), input.size(3), input.size(4),
+            osizeT, osizeH, osizeW);
+    } else {
+        adaptive_pool3d_float_kernel<<<grid, ktype, queue>>>(
+            input.data_ptr<float>(), output.data_ptr<float>(), total,
+            input.size(0), input.size(1), input.size(2), input.size(3), input.size(4),
+            osizeT, osizeH, osizeW);
+    }
+    return output;
+}
