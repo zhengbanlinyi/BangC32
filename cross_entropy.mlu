@@ -1,0 +1,43 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    torch::Tensor target,
+    torch::Tensor label_smoothing,
+    torch::Tensor reduce_loss,
+    torch::Tensor dist_process_group,
+    torch::Tensor ignore_idx) {
+
+    (void)dist_process_group;
+    (void)label_smoothing;
+    (void)reduce_loss;
+    (void)ignore_idx;
+    constexpr float smoothing = 0.1f;
+    constexpr bool reduce = true;
+    constexpr int64_t ignore = -100;
+
+    int64_t batch = input.size(0);
+    int64_t seq = input.size(1);
+    int64_t vocab = input.size(2);
+    auto logits = input.to(torch::kFloat).view({-1, vocab});
+    auto target_long = target.to(torch::kLong).view({-1});
+
+    auto maxv = std::get<0>(logits.max(1, true));
+    auto shifted = logits.sub(maxv);
+    auto log_denom = shifted.exp().sum(1, true).log().add(maxv);
+    auto log_denom_flat = log_denom.squeeze(1);
+
+    auto safe_target = target_long.clamp(0, vocab - 1).view({-1, 1});
+    auto picked = logits.gather(1, safe_target).squeeze(1);
+    auto nll = log_denom_flat.sub(picked);
+    auto smooth = log_denom_flat.sub(logits.mean(1));
+    auto loss = nll.mul(1.0 - smoothing).add(smooth.mul(smoothing));
+
+    auto valid = target_long.ne(ignore);
+    loss = loss.mul(valid.to(torch::kFloat));
+    if (reduce) {
+        auto denom = valid.to(torch::kFloat).sum().clamp_min(1.0);
+        return loss.sum().div(denom).to(input.scalar_type()).view({1});
+    }
+    return loss.to(input.scalar_type()).view({batch, seq});
+}

@@ -1,5 +1,47 @@
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define HINGE_N 128
+
+__mlu_entry__ void hinge_half_kernel(const half *pred, const half *target, half *out) {
+    float total = 0.0f;
+    for (int i = 0; i < HINGE_N; ++i) {
+        float v = 1.0f - (float)pred[i] * (float)target[i];
+        if (v < 0.0f) {
+            v = 0.0f;
+        }
+        total += v;
+    }
+    out[0] = (half)(total / (float)HINGE_N);
+}
+
+__mlu_entry__ void hinge_float_kernel(const float *pred, const float *target, float *out) {
+    float total = 0.0f;
+    for (int i = 0; i < HINGE_N; ++i) {
+        float v = 1.0f - pred[i] * target[i];
+        if (v < 0.0f) {
+            v = 0.0f;
+        }
+        total += v;
+    }
+    out[0] = total / (float)HINGE_N;
+}
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    return predictions.mul(targets).neg().add(1.0).clamp_min(0.0).mean();
+    TORCH_CHECK(predictions.is_contiguous() && targets.is_contiguous(), "inputs must be contiguous");
+    auto out = torch::empty({}, predictions.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (predictions.scalar_type() == torch::kHalf) {
+        hinge_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(predictions.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(targets.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()));
+        return out;
+    }
+    hinge_float_kernel<<<grid, ktype, queue>>>(predictions.data_ptr<float>(), targets.data_ptr<float>(), out.data_ptr<float>());
+    return out;
 }

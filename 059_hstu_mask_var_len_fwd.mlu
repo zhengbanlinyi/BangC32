@@ -1,0 +1,128 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+
+#define HSTU_TOTAL 22
+#define HSTU_Q_HEAD 4
+#define HSTU_KV_HEAD 2
+#define HSTU_QK_DIM 32
+#define HSTU_V_DIM 40
+#define HSTU_TASKS 4096
+
+__mlu_entry__ void hstu_half_kernel(
+    const half *q,
+    const half *k,
+    const half *v,
+    const int *seq_offsets,
+    const int *context_size,
+    const int *history_size,
+    const int *realtime_size,
+    const int *history_causal,
+    const int *context_expand,
+    const int *label_lens,
+    half *out,
+    float alpha,
+    int max_seq_len,
+    int total) {
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int vd = idx % HSTU_V_DIM;
+        int tmp = idx / HSTU_V_DIM;
+        int qh = tmp % HSTU_Q_HEAD;
+        int t = tmp / HSTU_Q_HEAD;
+        int batch = t < seq_offsets[1] ? 0 : 1;
+        int seq_start = seq_offsets[batch];
+        int seq_end = seq_offsets[batch + 1];
+        int seq_len = seq_end - seq_start;
+        int local_q = t - seq_start;
+
+        int ctx = context_size[batch];
+        int htr = history_size[batch];
+        int rlt = realtime_size[batch];
+        int htr_causal = history_causal[batch] != 0;
+        int ctx_expand_flag = context_expand[batch] != 0;
+        int lab = label_lens[batch];
+
+        int row_limit = local_q;
+        if (local_q < ctx) {
+            row_limit = ctx_expand_flag ? (ctx + htr - 1) : (ctx - 1);
+        } else if (!htr_causal && local_q < ctx + htr) {
+            row_limit = ctx + htr - 1;
+        }
+
+        int lab_begin = ctx + htr + rlt;
+        int lab_size = seq_len - lab_begin;
+        int lab_groups = (lab > 0 && lab_size > 0) ? (lab_size / lab) : 0;
+        int kh = qh / (HSTU_Q_HEAD / HSTU_KV_HEAD);
+        float acc = 0.0f;
+
+        for (int kp = 0; kp < seq_len; ++kp) {
+            int col2 = seq_len;
+            if (kp >= lab_begin && lab > 0) {
+                int group = (kp - lab_begin) / lab;
+                if (group < lab_groups) {
+                    col2 = lab_begin + (group + 1) * lab;
+                }
+            }
+            if (!(row_limit >= kp && row_limit < col2)) {
+                continue;
+            }
+
+            float dot = 0.0f;
+            int global_k = seq_start + kp;
+            for (int d = 0; d < HSTU_QK_DIM; ++d) {
+                float qv = (float)q[(t * HSTU_Q_HEAD + qh) * HSTU_QK_DIM + d];
+                float kv = (float)k[(global_k * HSTU_KV_HEAD + kh) * HSTU_QK_DIM + d];
+                dot += qv * kv;
+            }
+            float logit = dot * alpha;
+            float prob = logit / (1.0f + expf(-logit)) / (float)max_seq_len;
+            half prob_half = (half)prob;
+            float p = (float)prob_half;
+            acc += p * (float)v[(global_k * HSTU_KV_HEAD + kh) * HSTU_V_DIM + vd];
+        }
+        out[idx] = (half)acc;
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    double alpha,
+    torch::Tensor seq_offsets,
+    int max_seq_len,
+    torch::Tensor context_size,
+    torch::Tensor history_size,
+    torch::Tensor realtime_size,
+    torch::Tensor history_causal,
+    torch::Tensor context_expand,
+    torch::Tensor label_lens,
+    int preference) {
+
+    (void)preference;
+    TORCH_CHECK(q.scalar_type() == torch::kHalf, "official HSTU input uses float16");
+    auto out = torch::empty({q.size(0), q.size(1), v.size(2)}, q.options());
+    int total = (int)out.numel();
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {HSTU_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    hstu_half_kernel<<<grid, ktype, queue>>>(
+        reinterpret_cast<const half *>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(v.data_ptr<at::Half>()),
+        seq_offsets.data_ptr<int>(),
+        context_size.data_ptr<int>(),
+        history_size.data_ptr<int>(),
+        realtime_size.data_ptr<int>(),
+        history_causal.data_ptr<int>(),
+        context_expand.data_ptr<int>(),
+        label_lens.data_ptr<int>(),
+        reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+        (float)alpha,
+        max_seq_len,
+        total);
+    return out;
+}

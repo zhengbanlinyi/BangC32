@@ -1,0 +1,34 @@
+#include <torch/extension.h>
+#include <vector>
+
+static void apply_rope(torch::Tensor input, torch::Tensor cos, torch::Tensor sin, torch::Tensor output) {
+    int64_t last = input.dim() - 1;
+    int64_t table_last = cos.dim() - 1;
+    int64_t half_dim = input.size(last) / 2;
+
+    auto x0 = input.narrow(last, 0, half_dim);
+    auto x1 = input.narrow(last, half_dim, half_dim);
+    auto cos0 = cos.narrow(table_last, 0, half_dim);
+    auto cos1 = cos.narrow(table_last, half_dim, half_dim);
+    auto sin0 = sin.narrow(table_last, 0, half_dim);
+    auto sin1 = sin.narrow(table_last, half_dim, half_dim);
+
+    output.narrow(last, 0, half_dim).copy_(x0.mul(cos0).sub(x1.mul(sin0)));
+    output.narrow(last, half_dim, half_dim).copy_(x1.mul(cos1).add(x0.mul(sin1)));
+}
+
+std::vector<torch::Tensor> bang_func(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int unsqueeze_dim) {
+
+    auto cos_u = cos.unsqueeze(unsqueeze_dim);
+    auto sin_u = sin.unsqueeze(unsqueeze_dim);
+    auto q_out = torch::empty_like(q);
+    auto k_out = torch::empty_like(k);
+    apply_rope(q, cos_u, sin_u, q_out);
+    apply_rope(k, cos_u, sin_u, k_out);
+    return {q_out, k_out};
+}

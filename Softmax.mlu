@@ -1,0 +1,79 @@
+#include <bang.h>
+#include <bang_device_functions_math.h>
+#include <bang_device_functions_extra.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define SOFTMAX_ROWS 16
+#define SOFTMAX_COLS 16384
+#define SOFTMAX_TASKS 16
+
+__mlu_entry__ void softmax_half_kernel(const half *input, half *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows || cols != SOFTMAX_COLS) {
+        return;
+    }
+
+    __nram__ half nram_half[SOFTMAX_COLS];
+    __nram__ float nram_x[SOFTMAX_COLS];
+    __nram__ float nram_exp[SOFTMAX_COLS];
+    __nram__ float nram_reduce[64];
+
+    int base = row * cols;
+    __memcpy(nram_half, input + base, cols * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_half, cols);
+    __bang_argmax(nram_reduce, nram_x, cols);
+    float row_max = nram_reduce[0];
+    __bang_sub_scalar(nram_exp, nram_x, row_max, cols);
+    __bang_active_exphp(nram_exp, nram_exp, cols);
+    float inv_sum = 1.0f / __bang_sum(nram_exp, SOFTMAX_COLS);
+    __bang_mul_scalar(nram_exp, nram_exp, inv_sum, cols);
+    __bang_float2half_rd(nram_half, nram_exp, cols);
+    __memcpy(output + base, nram_half, cols * sizeof(half), NRAM2GDRAM);
+}
+
+__mlu_entry__ void softmax_float_kernel(const float *input, float *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows || cols != SOFTMAX_COLS) {
+        return;
+    }
+
+    __nram__ float nram_x[SOFTMAX_COLS];
+    __nram__ float nram_exp[SOFTMAX_COLS];
+    __nram__ float nram_reduce[64];
+
+    int base = row * cols;
+    __memcpy(nram_x, input + base, cols * sizeof(float), GDRAM2NRAM);
+    __bang_argmax(nram_reduce, nram_x, cols);
+    float row_max = nram_reduce[0];
+    __bang_sub_scalar(nram_exp, nram_x, row_max, cols);
+    __bang_active_exphp(nram_exp, nram_exp, cols);
+    float inv_sum = 1.0f / __bang_sum(nram_exp, SOFTMAX_COLS);
+    __bang_mul_scalar(nram_exp, nram_exp, inv_sum, cols);
+    __memcpy(output + base, nram_exp, cols * sizeof(float), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == SOFTMAX_COLS, "Only shape [16, 16384] is supported");
+
+    auto output = torch::empty_like(x);
+    int rows = (int)x.size(0);
+    int cols = (int)x.size(1);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {SOFTMAX_TASKS, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (x.scalar_type() == torch::kHalf) {
+        softmax_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            rows,
+            cols);
+        return output;
+    }
+
+    softmax_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>(), rows, cols);
+    return output;
+}
