@@ -22,7 +22,8 @@ torch::Tensor dispatch_scan(torch::Tensor x, int dim) {
     static auto op = c10::Dispatcher::singleton()
                          .findSchemaOrThrow(scan_schema_name().c_str(), "")
                          .typed<Fn>();
-    return op.call(x, static_cast<int64_t>(dim), c10::nullopt);
+    return op.call(x, static_cast<int64_t>(dim),
+                   c10::optional<c10::ScalarType>(c10::ScalarType::Float));
 }
 
 } // namespace

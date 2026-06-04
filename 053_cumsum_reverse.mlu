@@ -3,7 +3,6 @@
 #include <c10/core/ScalarType.h>
 #include <c10/util/Optional.h>
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -23,7 +22,8 @@ torch::Tensor dispatch_scan(torch::Tensor x, int dim) {
     static auto op = c10::Dispatcher::singleton()
                          .findSchemaOrThrow(scan_schema_name().c_str(), "")
                          .typed<Fn>();
-    return op.call(x, static_cast<int64_t>(dim), c10::nullopt);
+    return op.call(x, static_cast<int64_t>(dim),
+                   c10::optional<c10::ScalarType>(c10::ScalarType::Float));
 }
 
 } // namespace
@@ -34,8 +34,9 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.dim() == 2 && x.size(0) == 128 && x.size(1) == 4000,
                 "Only official shape [128, 4000] is supported");
     int axis = dim < 0 ? dim + static_cast<int>(x.dim()) : dim;
-    std::vector<int64_t> axes = {axis};
-    auto flipped = x.flip(axes).contiguous();
-    auto scanned = dispatch_scan(flipped, axis);
-    return scanned.flip(axes);
+    auto order = torch::arange(x.size(axis) - 1, -1, -1,
+                               x.options().dtype(torch::kLong));
+    auto reversed = x.index_select(axis, order).contiguous();
+    auto scanned = dispatch_scan(reversed, axis);
+    return scanned.index_select(axis, order);
 }
