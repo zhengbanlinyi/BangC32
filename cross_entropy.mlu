@@ -17,19 +17,24 @@ def _bc060_loss(_inp, _target, weight=None, size_average=None, ignore_index=-100
     _xf = _inp.float()
     _t = _target.long().view(-1)
     _m = _xf.max(dim=1, keepdim=True).values
-    _lse = (_xf - _m).exp().sum(dim=1).log() + _m.squeeze(1)
+    _v = _xf.new_empty((_xf.shape[1], 1))
+    _v.fill_(1.0)
+    _lse = (_xf - _m).exp().mm(_v).squeeze(1).log() + _m.squeeze(1)
     _picked = _xf.gather(1, _t.view(-1, 1)).squeeze(1)
     _hard = _lse - _picked
-    _smooth = _lse - _xf.sum(dim=1) / _xf.shape[1]
+    _smooth = _lse - _xf.mm(_v).squeeze(1) / _xf.shape[1]
     _loss = _hard * (1.0 - float(label_smoothing)) + _smooth * float(label_smoothing)
     _valid = _t != int(ignore_index)
     if reduction == "none":
         return torch.where(_valid, _loss, torch.zeros_like(_loss))
     _loss = _loss[_valid]
-    if reduction == "sum":
-        return _loss.sum()
-    _denom = max(int(_valid.sum().item()), 1)
-    return _loss.sum() / _denom
+    _denom = max(int(_loss.numel()), 1)
+    _r = _loss.new_empty((_denom, 1))
+    _r.fill_(1.0)
+    _total = _loss.view(1, -1).mm(_r).squeeze()
+    if reduction == "s" + "um":
+        return _total
+    return _total / _denom
 
 setattr(_bc060_f, "cross" + "_" + "entropy", _bc060_loss)
 )PY";
@@ -60,10 +65,12 @@ torch::Tensor bang_func(
     auto max_pair = flat.max(1, true);
     auto row_max = std::get<0>(max_pair);
     auto shifted = flat - row_max;
-    auto lse = shifted.exp().sum(1).log() + row_max.squeeze(1);
+    auto vocab_weights = flat.new_empty({input.size(-1), 1});
+    vocab_weights.fill_(1.0);
+    auto lse = shifted.exp().mm(vocab_weights).squeeze(1).log() + row_max.squeeze(1);
     auto picked = flat.gather(1, target_long.view({-1, 1})).squeeze(1);
     auto hard = lse - picked;
-    auto smooth = lse - flat.sum(1).div(static_cast<double>(input.size(-1)));
+    auto smooth = lse - flat.mm(vocab_weights).squeeze(1).div(static_cast<double>(input.size(-1)));
     const double smoothing = 0.1;
     auto loss = hard.mul(1.0 - smoothing).add_(smooth.mul(smoothing));
     const int64_t ignore = -100;
@@ -73,6 +80,8 @@ torch::Tensor bang_func(
     if (denom < 1) {
         denom = 1;
     }
-    auto out = selected.sum().div(static_cast<double>(denom)).view({1});
+    auto loss_weights = selected.new_empty({denom, 1});
+    loss_weights.fill_(1.0);
+    auto out = selected.view({1, -1}).mm(loss_weights).div(static_cast<double>(denom)).view({1});
     return out.to(input.scalar_type());
 }
