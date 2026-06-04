@@ -1,0 +1,53 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+
+__mlu_entry__ void bilinear2d_half_kernel(const half *input, half *output, int64_t total,
+                                          int n_size, int c_size, int in_h, int in_w,
+                                          int out_h, int out_w, bool align_corners) {
+    int64_t stride = taskDim;
+    float rheight = (align_corners && out_h > 1) ? (float)(in_h - 1) / (float)(out_h - 1) : (float)in_h / (float)out_h;
+    float rwidth = (align_corners && out_w > 1) ? (float)(in_w - 1) / (float)(out_w - 1) : (float)in_w / (float)out_w;
+    for (int64_t idx = taskId; idx < total; idx += stride) {
+        int ow = idx % out_w;
+        int64_t tmp = idx / out_w;
+        int oh = tmp % out_h;
+        tmp /= out_h;
+        int c = tmp % c_size;
+        int n = tmp / c_size;
+        float ihf = align_corners ? oh * rheight : ((oh + 0.5f) * rheight - 0.5f);
+        float iwf = align_corners ? ow * rwidth : ((ow + 0.5f) * rwidth - 0.5f);
+        ihf = fminf(fmaxf(ihf, 0.0f), (float)(in_h - 1));
+        iwf = fminf(fmaxf(iwf, 0.0f), (float)(in_w - 1));
+        int ih0 = (int)ihf;
+        int iw0 = (int)iwf;
+        int ih1 = ih0 + 1 < in_h ? ih0 + 1 : in_h - 1;
+        int iw1 = iw0 + 1 < in_w ? iw0 + 1 : in_w - 1;
+        float lh = ihf - ih0;
+        float lw = iwf - iw0;
+        int64_t base = ((int64_t)n * c_size + c) * in_h * in_w;
+        float v00 = (float)input[base + ih0 * in_w + iw0];
+        float v01 = (float)input[base + ih0 * in_w + iw1];
+        float v10 = (float)input[base + ih1 * in_w + iw0];
+        float v11 = (float)input[base + ih1 * in_w + iw1];
+        float top = v00 * (1.0f - lw) + v01 * lw;
+        float bot = v10 * (1.0f - lw) + v11 * lw;
+        output[idx] = (half)(top * (1.0f - lh) + bot * lh);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, int out_h, int out_w, bool align_corners = false) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == 4, "input must be NCHW");
+    auto output = torch::empty({input.size(0), input.size(1), out_h, out_w}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    bilinear2d_half_kernel<<<grid, ktype, queue>>>(
+        reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(output.data_ptr<at::Half>()), output.numel(),
+        input.size(0), input.size(1), input.size(2), input.size(3), out_h, out_w, align_corners);
+    return output;
+}

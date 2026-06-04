@@ -1,0 +1,66 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+__mlu_entry__ void renorm_half_kernel(const half *input, half *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows) {
+        return;
+    }
+    int64_t base = (int64_t)row * cols;
+    float s = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        s += (float)input[base + c];
+    }
+    if (s > 0.0f) {
+        for (int c = 0; c < cols; ++c) {
+            output[base + c] = (half)((float)input[base + c] / s);
+        }
+    } else {
+        for (int c = 0; c < cols; ++c) {
+            output[base + c] = input[base + c];
+        }
+    }
+}
+
+__mlu_entry__ void renorm_float_kernel(const float *input, float *output, int rows, int cols) {
+    int row = taskId;
+    if (row >= rows) {
+        return;
+    }
+    int64_t base = (int64_t)row * cols;
+    float s = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        s += input[base + c];
+    }
+    if (s > 0.0f) {
+        for (int c = 0; c < cols; ++c) {
+            output[base + c] = input[base + c] / s;
+        }
+    } else {
+        for (int c = 0; c < cols; ++c) {
+            output[base + c] = input[base + c];
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input_tensor) {
+    TORCH_CHECK(input_tensor.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input_tensor.dim() == 2, "input must be 2D");
+    auto output = torch::empty_like(input_tensor);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {(unsigned int)input_tensor.size(0), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (input_tensor.scalar_type() == torch::kHalf) {
+        renorm_half_kernel<<<grid, ktype, queue>>>(
+            reinterpret_cast<const half *>(input_tensor.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            input_tensor.size(0), input_tensor.size(1));
+    } else {
+        renorm_float_kernel<<<grid, ktype, queue>>>(
+            input_tensor.data_ptr<float>(), output.data_ptr<float>(),
+            input_tensor.size(0), input_tensor.size(1));
+    }
+    return output;
+}

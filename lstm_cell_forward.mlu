@@ -1,0 +1,43 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+
+__mlu_entry__ void lstm_cell_half_kernel(const half *input, const half *hidden, const half *bias1,
+                                         const half *bias2, const half *cx, half *hy,
+                                         int hsz, int total) {
+    int64_t stride = taskDim;
+    for (int idx = taskId; idx < total; idx += stride) {
+        int h = idx % hsz;
+        int b = idx / hsz;
+        int64_t base = ((int64_t)b * 4 * hsz) + h;
+        float igv = (float)input[base] + (float)hidden[base] + (float)bias1[h] + (float)bias2[h];
+        float fgv = (float)input[base + hsz] + (float)hidden[base + hsz] + (float)bias1[hsz + h] + (float)bias2[hsz + h];
+        float cgv = (float)input[base + 2 * hsz] + (float)hidden[base + 2 * hsz] + (float)bias1[2 * hsz + h] + (float)bias2[2 * hsz + h];
+        float ogv = (float)input[base + 3 * hsz] + (float)hidden[base + 3 * hsz] + (float)bias1[3 * hsz + h] + (float)bias2[3 * hsz + h];
+        float ig = 1.0f / (1.0f + expf(-igv));
+        float fg = 1.0f / (1.0f + expf(-fgv));
+        float cg = 2.0f / (1.0f + expf(-2.0f * cgv)) - 1.0f;
+        float og = 1.0f / (1.0f + expf(-ogv));
+        float cy = fg * (float)cx[idx] + ig * cg;
+        hy[idx] = (half)(og * (2.0f / (1.0f + expf(-2.0f * cy)) - 1.0f));
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, torch::Tensor hidden, torch::Tensor bias1,
+                        torch::Tensor bias2, torch::Tensor cx, int hsz, int totalElements) {
+    auto hy = torch::empty({totalElements}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid = {512, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    lstm_cell_half_kernel<<<grid, ktype, queue>>>(
+        reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(hidden.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(bias1.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(bias2.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(cx.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(hy.data_ptr<at::Half>()),
+        hsz, totalElements);
+    return hy;
+}
