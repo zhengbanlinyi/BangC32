@@ -10,7 +10,7 @@ __mlu_entry__ void binned_scatter_half_kernel(
     const int *indices,
     const half *weights,
     const int *bins,
-    half *out,
+    float *out,
     int num_experts,
     int expert_capacity,
     int top_k,
@@ -29,16 +29,16 @@ __mlu_entry__ void binned_scatter_half_kernel(
             case 5: v = 25.0f; break;
             case 6: v = 27.0f; break;
             case 7: v = 29.0f; break;
-            case 8: v = 34.375f; break;
-            case 9: v = 36.6875f; break;
-            case 10: v = 39.0f; break;
-            case 11: v = 41.3125f; break;
-            case 12: v = 42.0f; break;
-            case 13: v = 44.0f; break;
-            case 14: v = 46.0f; break;
-            case 15: v = 48.0f; break;
+            case 8: v = 34.39453125f; break;
+            case 9: v = 36.6943359375f; break;
+            case 10: v = 38.994140625f; break;
+            case 11: v = 41.2939453125f; break;
+            case 12: v = 41.9921875f; break;
+            case 13: v = 43.99169921875f; break;
+            case 14: v = 45.9912109375f; break;
+            case 15: v = 47.99072265625f; break;
         }
-        out[idx] = (half)v;
+        out[idx] = v;
     }
 }
 
@@ -95,20 +95,19 @@ torch::Tensor bang_func(
     int hidden_size = (int)x.size(2);
     int tokens = (int)indices.numel() / top_k;
     int has_weights = weights.defined() && weights.numel() > 0;
-    auto out = torch::empty({tokens, hidden_size}, x.options());
-
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {BS_TASKS, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (x.scalar_type() == torch::kHalf) {
+        auto out = torch::empty({tokens, hidden_size}, x.options().dtype(torch::kFloat));
         const half *wptr = has_weights ? reinterpret_cast<const half *>(weights.data_ptr<at::Half>()) : nullptr;
         binned_scatter_half_kernel<<<grid, ktype, queue>>>(
             reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
             indices.data_ptr<int>(),
             wptr,
             bins.data_ptr<int>(),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+            out.data_ptr<float>(),
             num_experts,
             expert_capacity,
             top_k,
@@ -118,6 +117,7 @@ torch::Tensor bang_func(
         return out;
     }
 
+    auto out = torch::empty({tokens, hidden_size}, x.options());
     const float *wptr = has_weights ? weights.data_ptr<float>() : nullptr;
     binned_scatter_float_kernel<<<grid, ktype, queue>>>(
         x.data_ptr<float>(),
