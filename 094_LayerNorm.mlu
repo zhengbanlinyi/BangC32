@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 
-torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int64_t normalized_shape) {
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int normalized_shape) {
     auto xc = x.contiguous();
     auto flat = xc.view({-1, normalized_shape});
     auto mean = flat.mean(1, true);

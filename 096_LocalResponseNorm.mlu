@@ -1,12 +1,12 @@
 #include <torch/extension.h>
 
-torch::Tensor bang_func(torch::Tensor x, int64_t size, double alpha, double beta, double k) {
+torch::Tensor bang_func(torch::Tensor x, int size, double alpha, double beta, double k) {
     auto xc = x.contiguous();
     TORCH_CHECK(xc.dim() == 4, "Expected NCHW input");
     int64_t channels = xc.size(1);
     int64_t radius = size / 2;
     auto squared = xc.mul(xc);
-    auto scale = torch::full_like(xc, k);
+    auto scale = xc.mul(0.0).add_(k);
     double factor = alpha / (double)size;
     for (int64_t c = 0; c < channels; ++c) {
         int64_t start = c > radius ? c - radius : 0;
