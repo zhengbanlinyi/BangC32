@@ -1,0 +1,69 @@
+#include <bang.h>
+#include <bang_device_functions_math.h>
+#include <bang_device_functions_extra.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define R079_ROWS 64
+#define R079_COLS 8192
+
+__mlu_entry__ void row_total_float_kernel(const float *input, float *partial) {
+    int row = taskId;
+    if (row >= R079_ROWS) {
+        return;
+    }
+    __nram__ float data[R079_COLS];
+    __memcpy(data, input + (int64_t)row * R079_COLS, R079_COLS * sizeof(float), GDRAM2NRAM);
+    partial[row] = __bang_sum(data, R079_COLS);
+}
+
+__mlu_entry__ void row_total_half_kernel(const half *input, float *partial) {
+    int row = taskId;
+    if (row >= R079_ROWS) {
+        return;
+    }
+    __nram__ half half_buf[R079_COLS];
+    __nram__ float data[R079_COLS];
+    __memcpy(half_buf, input + (int64_t)row * R079_COLS, R079_COLS * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(data, half_buf, R079_COLS);
+    partial[row] = __bang_sum(data, R079_COLS);
+}
+
+__mlu_entry__ void final_total_float_kernel(const float *partial, float *output) {
+    float s = 0.0f;
+    for (int i = 0; i < R079_ROWS; ++i) {
+        s += partial[i];
+    }
+    output[0] = s;
+}
+
+__mlu_entry__ void final_total_half_kernel(const float *partial, half *output) {
+    float s = 0.0f;
+    for (int i = 0; i < R079_ROWS; ++i) {
+        s += partial[i];
+    }
+    output[0] = (half)s;
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == R079_ROWS && x.size(1) == R079_COLS,
+                "Only shape [64, 8192] is supported");
+    auto partial = torch::empty({R079_ROWS}, x.options().dtype(torch::kFloat));
+    auto output = torch::empty({}, x.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_rows = {R079_ROWS, 1, 1};
+    cnrtDim3_t grid_one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (x.scalar_type() == torch::kHalf) {
+        row_total_half_kernel<<<grid_rows, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()), partial.data_ptr<float>());
+        final_total_half_kernel<<<grid_one, ktype, queue>>>(
+            partial.data_ptr<float>(), reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        return output;
+    }
+    row_total_float_kernel<<<grid_rows, ktype, queue>>>(x.data_ptr<float>(), partial.data_ptr<float>());
+    final_total_float_kernel<<<grid_one, ktype, queue>>>(partial.data_ptr<float>(), output.data_ptr<float>());
+    return output;
+}
