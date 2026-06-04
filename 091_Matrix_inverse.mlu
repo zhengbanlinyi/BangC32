@@ -7,8 +7,11 @@ torch::Tensor bang_func(torch::Tensor A) {
     int64_t n = Ac.size(1);
     auto aug = torch::empty({batch, n, n * 2}, Ac.options());
     aug.slice(2, 0, n).copy_(Ac);
-    auto eye = torch::eye(n, Ac.options()).unsqueeze(0).expand({batch, n, n});
-    aug.slice(2, n, n * 2).copy_(eye);
+    auto rhs = aug.slice(2, n, n * 2);
+    rhs.zero_();
+    for (int64_t i = 0; i < n; ++i) {
+        rhs.select(1, i).select(1, i).fill_(1.0);
+    }
 
     for (int64_t p = 0; p < n; ++p) {
         auto pivot_row = aug.select(1, p);
