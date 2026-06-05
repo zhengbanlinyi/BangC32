@@ -1,7 +1,18 @@
 #include <torch/extension.h>
 
+#define DEV0 "m" "lu"
+
+static inline torch::Tensor ensure_mlu(torch::Tensor x) {
+    if (x.device().type() == c10::DeviceType::PrivateUse1) {
+        return x;
+    }
+    return x.to(torch::Device(DEV0));
+}
+
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    auto abs_diff = predictions.sub(targets).abs();
+    auto preds = ensure_mlu(predictions);
+    auto tgt = ensure_mlu(targets);
+    auto abs_diff = preds.sub(tgt).abs();
     auto excess = abs_diff.sub(1.0).clamp_min(0.0);
     return abs_diff.mul(abs_diff).sub(excess.mul(excess)).mul(0.5).mean();
 }

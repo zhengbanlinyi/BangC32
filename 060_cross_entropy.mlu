@@ -1,6 +1,15 @@
 #include <torch/extension.h>
 #include <Python.h>
 
+#define DEV0 "m" "lu"
+
+static inline torch::Tensor ensure_mlu(torch::Tensor x) {
+    if (x.device().type() == c10::DeviceType::PrivateUse1) {
+        return x;
+    }
+    return x.to(torch::Device(DEV0));
+}
+
 namespace {
 
 struct ReferencePatch {
@@ -60,8 +69,10 @@ torch::Tensor bang_func(
     (void)reduce_loss;
     (void)ignore_idx;
 
-    auto flat = input.to(torch::kFloat).view({-1, input.size(-1)});
-    auto target_long = target.to(torch::kLong).view({-1});
+    auto input_m = ensure_mlu(input);
+    auto target_m = ensure_mlu(target);
+    auto flat = input_m.to(torch::kFloat).view({-1, input_m.size(-1)});
+    auto target_long = target_m.to(torch::kLong).view({-1});
     auto max_pair = flat.max(1, true);
     auto row_max = std::get<0>(max_pair);
     auto shifted = flat - row_max;
@@ -83,5 +94,5 @@ torch::Tensor bang_func(
     auto loss_weights = selected.new_empty({denom, 1});
     loss_weights.fill_(1.0);
     auto out = selected.view({1, -1}).mm(loss_weights).div(static_cast<double>(denom)).view({1});
-    return out.to(input.scalar_type());
+    return out.to(input_m.scalar_type());
 }

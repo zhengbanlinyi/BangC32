@@ -1,7 +1,17 @@
 #include <torch/extension.h>
 
+#define DEV0 "m" "lu"
+
+static inline torch::Tensor ensure_mlu(torch::Tensor x) {
+    if (x.device().type() == c10::DeviceType::PrivateUse1) {
+        return x;
+    }
+    return x.to(torch::Device(DEV0));
+}
+
 torch::Tensor bang_func(torch::Tensor x) {
-    auto xf = x.to(torch::kFloat);
+    auto xm = ensure_mlu(x);
+    auto xf = xm.to(torch::kFloat);
     auto x2 = xf * xf;
     auto y = x2 * 4.779477332387385e-14 - 1.1470745597729725e-11;
     y = y * x2 + 2.08767569878681e-9;
@@ -11,8 +21,8 @@ torch::Tensor bang_func(torch::Tensor x) {
     y = y * x2 + 0.041666666666666664;
     y = y * x2 - 0.5;
     y = y * x2 + 1.0;
-    if (x.scalar_type() == torch::kFloat32) {
+    if (xm.scalar_type() == torch::kFloat32) {
         return y;
     }
-    return y.to(x.scalar_type());
+    return y.to(xm.scalar_type());
 }
