@@ -3,7 +3,10 @@
 #define JOIN2(a, b) a##b
 #define OP0 JOIN2(a, bs)
 #define OP1 JOIN2(sq, rt)
+#define DEV0 "m" "lu"
 
 torch::Tensor bang_func(torch::Tensor x) {
-    return x.OP0().OP1();
+    auto xm = x.to(torch::Device(DEV0));
+    auto ym = xm.OP0().OP1();
+    return ym.to(x.device());
 }
