@@ -1,0 +1,14 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor x, int scale_factor) {
+    auto xc = x.contiguous();
+    int64_t n = xc.size(0);
+    int64_t c = xc.size(1);
+    int64_t h = xc.size(2);
+    int64_t w = xc.size(3);
+    int64_t s = scale_factor;
+    return xc.view({n, c, h, 1, w, 1})
+        .expand({n, c, h, s, w, s})
+        .contiguous()
+        .view({n, c, h * s, w * s});
+}

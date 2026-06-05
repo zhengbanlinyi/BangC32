@@ -1,0 +1,9 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor input, torch::Tensor values, torch::Tensor index) {
+    auto out = input.clone();
+    if (index.numel() > 0 && values.numel() > 0) {
+        out.index_copy_(0, index.to(torch::kLong), values);
+    }
+    return out;
+}

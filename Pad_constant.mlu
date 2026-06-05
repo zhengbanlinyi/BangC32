@@ -1,0 +1,15 @@
+#include <torch/extension.h>
+#include <vector>
+
+torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> pad, double value) {
+    auto xc = x.contiguous();
+    TORCH_CHECK(pad.size() == 4, "expected four padding values");
+    int64_t left = pad[0];
+    int64_t right = pad[1];
+    int64_t top = pad[2];
+    int64_t bottom = pad[3];
+    auto out = torch::empty({xc.size(0), xc.size(1), xc.size(2) + top + bottom, xc.size(3) + left + right}, xc.options());
+    out.fill_(value);
+    out.slice(2, top, top + xc.size(2)).slice(3, left, left + xc.size(3)).copy_(xc);
+    return out;
+}
