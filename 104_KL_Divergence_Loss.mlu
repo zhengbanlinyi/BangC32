@@ -1,0 +1,8 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+    auto t = target_prob.to(torch::kFloat);
+    auto inp = input_log_prob.to(torch::kFloat);
+    auto out = (t * (t.log() - inp)).sum() / static_cast<double>(input_log_prob.size(0));
+    return out.to(input_log_prob.scalar_type());
+}

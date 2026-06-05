@@ -1,0 +1,6 @@
+#include <torch/extension.h>
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    auto diff = (predictions - targets).to(torch::kFloat);
+    return diff.mul(diff).mean().to(predictions.scalar_type());
+}

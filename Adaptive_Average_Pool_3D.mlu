@@ -1,0 +1,16 @@
+#include <torch/extension.h>
+#include <vector>
+
+torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
+    auto xc = x.contiguous();
+    TORCH_CHECK(output_size.size() == 3, "expected three output dimensions");
+    int64_t od = output_size[0];
+    int64_t oh = output_size[1];
+    int64_t ow = output_size[2];
+    int64_t kd = xc.size(2) / od;
+    int64_t kh = xc.size(3) / oh;
+    int64_t kw = xc.size(4) / ow;
+    auto blocks = xc.to(torch::kFloat).view({xc.size(0), xc.size(1), od, kd, oh, kh, ow, kw});
+    auto out = blocks.mean(7).mean(5).mean(3);
+    return out.to(x.scalar_type()).contiguous();
+}
