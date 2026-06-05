@@ -13,8 +13,8 @@
 #define BOP0 JOIN2(__bang_a, bs)
 #define BOP1 JOIN2(__bang_sq, rt)
 
-#define R070_CHUNK 4096
-#define R070_TASKS 512
+#define R070_CHUNK 2048
+#define R070_TASKS 64
 
 __mlu_entry__ void r070_half_kernel(const half *input, half *output, int total) {
     __nram__ half hbuf[R070_CHUNK];
