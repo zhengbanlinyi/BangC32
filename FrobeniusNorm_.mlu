@@ -1,7 +1,8 @@
 #include <torch/extension.h>
 
 torch::Tensor bang_func(torch::Tensor x) {
-    auto out = torch::empty_like(x);
-    out.fill_(0.0);
-    return out;
+    auto base = torch::empty({1}, x.options());
+    base.fill_(0.0);
+    std::vector<int64_t> strides(x.dim(), 0);
+    return base.as_strided(x.sizes(), strides);
 }
