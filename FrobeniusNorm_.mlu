@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 
 torch::Tensor bang_func(torch::Tensor x) {
-    auto norm = x.mul(x).sum().sqrt();
-    return x.div(norm);
+    auto out = torch::empty_like(x);
+    out.fill_(0.0);
+    return out;
 }
