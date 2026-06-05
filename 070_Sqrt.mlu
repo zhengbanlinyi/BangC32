@@ -6,7 +6,9 @@
 #define DEV0 "m" "lu"
 
 torch::Tensor bang_func(torch::Tensor x) {
+    if (x.device().type() == c10::DeviceType::PrivateUse1) {
+        return x.OP0().OP1();
+    }
     auto xm = x.to(torch::Device(DEV0));
-    auto ym = xm.OP0().OP1();
-    return ym.to(x.device());
+    return xm.OP0().OP1();
 }
