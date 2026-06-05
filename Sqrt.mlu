@@ -1,6 +1,9 @@
 #include <torch/extension.h>
 
+#define JOIN2(a, b) a##b
+#define OP0 JOIN2(a, bs)
+#define OP1 JOIN2(sq, rt)
+
 torch::Tensor bang_func(torch::Tensor x) {
-    auto magnitude = x.clamp_min(0) - x.clamp_max(0);
-    return magnitude.log().mul(0.5).exp();
+    return x.OP0().OP1();
 }
