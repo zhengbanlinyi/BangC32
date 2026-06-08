@@ -38,57 +38,11 @@ __mlu_entry__ void bilinear2d_half_kernel(const half *input, half *output, int64
     }
 }
 
-__mlu_entry__ void r068_fixed_plane_kernel(const half *input, half *output) {
-    const int h0[15] = {0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7};
-    const int h1[15] = {1, 1, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6, 7, 7, 7};
-    const float hw[15] = {
-        0.0f, 0.3f, 0.833333333f, 0.366666667f, 0.9f,
-        0.433333333f, 0.966666667f, 0.5f, 0.0333333333f, 0.566666667f,
-        0.1f, 0.633333333f, 0.166666667f, 0.7f, 0.0f};
-    const int w0[17] = {0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8};
-    const int w1[17] = {1, 1, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8};
-    const float ww[17] = {
-        0.0f, 0.294117647f, 0.823529412f, 0.352941176f, 0.882352941f,
-        0.411764706f, 0.941176471f, 0.470588235f, 0.0f, 0.529411765f,
-        0.0588235294f, 0.588235294f, 0.117647059f, 0.647058824f,
-        0.176470588f, 0.705882353f, 0.0f};
-    for (int plane = taskId; plane < 6; plane += taskDim) {
-        const half *src = input + plane * 72;
-        half *dst = output + plane * 255;
-        for (int oh = 0; oh < 15; ++oh) {
-            float lh = hw[oh];
-            float uh = 1.0f - lh;
-            int row0 = h0[oh] * 9;
-            int row1 = h1[oh] * 9;
-            for (int ow = 0; ow < 17; ++ow) {
-                float lw = ww[ow];
-                float uw = 1.0f - lw;
-                float v00 = (float)src[row0 + w0[ow]];
-                float v01 = (float)src[row0 + w1[ow]];
-                float v10 = (float)src[row1 + w0[ow]];
-                float v11 = (float)src[row1 + w1[ow]];
-                float top = v00 * uw + v01 * lw;
-                float bot = v10 * uw + v11 * lw;
-                dst[oh * 17 + ow] = (half)(top * uh + bot * lh);
-            }
-        }
-    }
-}
-
 torch::Tensor bang_func(torch::Tensor input, int out_h, int out_w, bool align_corners = false) {
     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
     TORCH_CHECK(input.dim() == 4, "input must be NCHW");
     auto output = torch::empty({input.size(0), input.size(1), out_h, out_w}, input.options());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    if (!align_corners && input.size(0) == 2 && input.size(1) == 3 &&
-        input.size(2) == 8 && input.size(3) == 9 && out_h == 15 && out_w == 17) {
-        cnrtDim3_t grid = {6, 1, 1};
-        cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-        r068_fixed_plane_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(output.data_ptr<at::Half>()));
-        return output;
-    }
     cnrtDim3_t grid = {512, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     bilinear2d_half_kernel<<<grid, ktype, queue>>>(
