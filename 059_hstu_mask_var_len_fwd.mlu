@@ -9,7 +9,7 @@
 #define HSTU_KV_HEAD 2
 #define HSTU_QK_DIM 32
 #define HSTU_V_DIM 40
-#define HSTU_TASKS 4096
+#define HSTU_TASKS 128
 
 __mlu_entry__ void hstu_half_kernel(
     const half *q,
@@ -27,11 +27,10 @@ __mlu_entry__ void hstu_half_kernel(
     int max_seq_len,
     int total) {
 
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int vd = idx % HSTU_V_DIM;
-        int tmp = idx / HSTU_V_DIM;
-        int qh = tmp % HSTU_Q_HEAD;
-        int t = tmp / HSTU_Q_HEAD;
+    const int rows = HSTU_TOTAL * HSTU_Q_HEAD;
+    for (int row = taskId; row < rows; row += taskDim) {
+        int qh = row % HSTU_Q_HEAD;
+        int t = row / HSTU_Q_HEAD;
         int batch = t < seq_offsets[1] ? 0 : 1;
         int seq_start = seq_offsets[batch];
         int seq_end = seq_offsets[batch + 1];
@@ -56,7 +55,10 @@ __mlu_entry__ void hstu_half_kernel(
         int lab_size = seq_len - lab_begin;
         int lab_groups = (lab > 0 && lab_size > 0) ? (lab_size / lab) : 0;
         int kh = qh / (HSTU_Q_HEAD / HSTU_KV_HEAD);
-        float acc = 0.0f;
+        float acc[HSTU_V_DIM];
+        for (int vd = 0; vd < HSTU_V_DIM; ++vd) {
+            acc[vd] = 0.0f;
+        }
 
         for (int kp = 0; kp < seq_len; ++kp) {
             int col2 = seq_len;
@@ -81,9 +83,15 @@ __mlu_entry__ void hstu_half_kernel(
             float prob = logit / (1.0f + expf(-logit)) / (float)max_seq_len;
             half prob_half = (half)prob;
             float p = (float)prob_half;
-            acc += p * (float)v[(global_k * HSTU_KV_HEAD + kh) * HSTU_V_DIM + vd];
+            const half *v_row = v + (global_k * HSTU_KV_HEAD + kh) * HSTU_V_DIM;
+            for (int vd = 0; vd < HSTU_V_DIM; ++vd) {
+                acc[vd] += p * (float)v_row[vd];
+            }
         }
-        out[idx] = (half)acc;
+        half *out_row = out + (t * HSTU_Q_HEAD + qh) * HSTU_V_DIM;
+        for (int vd = 0; vd < HSTU_V_DIM; ++vd) {
+            out_row[vd] = (half)acc[vd];
+        }
     }
 }
 
