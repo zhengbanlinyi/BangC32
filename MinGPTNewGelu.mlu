@@ -68,12 +68,7 @@ __mlu_entry__ void new_gelu_half_kernel(
         __bang_mul_scalar(nram_tmp, nram_tmp, GELU_K, aligned_len);
         __bang_add(nram_act, nram_x, nram_tmp, aligned_len);
         __bang_mul_scalar(nram_act, nram_act, GELU_C, aligned_len);
-        __bang_mul_scalar(nram_act, nram_act, -2.0f, aligned_len);
-        __bang_active_exphp(nram_act, nram_act, aligned_len);
-        __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
-        __bang_recip(nram_act, nram_act, aligned_len);
-        __bang_mul_scalar(nram_act, nram_act, 2.0f, aligned_len);
-        __bang_sub_scalar(nram_act, nram_act, 1.0f, aligned_len);
+        __bang_active_tanh(nram_act, nram_act, aligned_len);
         __bang_add_scalar(nram_act, nram_act, 1.0f, aligned_len);
         __bang_mul(nram_x, nram_x, nram_act, aligned_len);
         __bang_mul_scalar(nram_x, nram_x, 0.5f, aligned_len);
