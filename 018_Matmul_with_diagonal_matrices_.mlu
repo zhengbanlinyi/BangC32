@@ -1,10 +1,5 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
-
-__mlu_entry__ void diagonal_matmul_noop_kernel() {
-}
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    return A.unsqueeze(1) * B;
+    return A.reshape({A.size(0), 1}) * B;
 }
