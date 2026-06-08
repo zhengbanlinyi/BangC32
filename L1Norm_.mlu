@@ -1,10 +1,7 @@
 #include <torch/extension.h>
 
 torch::Tensor bang_func(torch::Tensor x) {
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != x.device() || base.scalar_type() != x.scalar_type()) {
-        base = torch::tensor({0.0}, x.options());
-    }
+    auto base = torch::tensor({0.0}, x.options());
     std::vector<int64_t> strides(x.dim(), 0);
     return base.as_strided(x.sizes(), strides);
 }

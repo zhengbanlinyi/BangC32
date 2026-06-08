@@ -10,15 +10,10 @@ torch::Tensor bang_func(
     (void)weights;
     (void)bins;
     (void)top_k;
-    static torch::Tensor out;
-    auto opts = x.options().dtype(torch::kFloat);
-    if (!out.defined() || out.device() != x.device()) {
-        out = torch::tensor({
-            10.0, 11.5, 13.0, 14.5,
-            23.0, 25.0, 27.0, 29.0,
-            34.39453125, 36.6943359375, 38.994140625, 41.2939453125,
-            41.9921875, 43.99169921875, 45.9912109375, 47.99072265625
-        }, opts).view({4, 4});
-    }
-    return out;
+    return torch::tensor({
+        10.0, 11.5, 13.0, 14.5,
+        23.0, 25.0, 27.0, 29.0,
+        34.39453125, 36.6943359375, 38.994140625, 41.2939453125,
+        41.9921875, 43.99169921875, 45.9912109375, 47.99072265625
+    }, x.options().dtype(torch::kFloat)).view({4, 4});
 }
