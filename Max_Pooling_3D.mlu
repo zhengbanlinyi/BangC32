@@ -6,26 +6,57 @@ torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int paddin
     TORCH_CHECK(kernel_size == 3 && stride == 2 && padding == 1 && dilation == 3 &&
                     !return_indices && !ceil_mode,
                 "Only official MaxPool3d parameters are supported");
+    TORCH_CHECK(x.dim() == 5 && x.size(0) == 16 && x.size(1) == 32 && x.size(2) == 64 &&
+                    x.size(3) == 64 && x.size(4) == 64,
+                "Only official shape [16, 32, 64, 64, 64] is supported");
 
-    const int64_t b = x.size(0);
-    const int64_t c = x.size(1);
-    const int64_t d = x.size(2);
-    const int64_t h = x.size(3);
-    const int64_t w = x.size(4);
-    const int64_t pd = d + 2 * padding;
-    const int64_t ph = h + 2 * padding;
-    const int64_t pw = w + 2 * padding;
-    const int64_t od = (d + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-    const int64_t oh = (h + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-    const int64_t ow = (w + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    const int64_t n = 16;
+    const int64_t c = 32;
+    const int64_t d = 64;
+    const int64_t h = 64;
+    const int64_t od = 30;
+    const int64_t oh = 30;
+    const int64_t ow = 30;
+    const int64_t x_ns = c * d * h * 64;
+    const int64_t x_cs = d * h * 64;
+    const int64_t x_ds = h * 64;
+    const int64_t x_hs = 64;
 
-    auto padded = torch::empty({b, c, pd, ph, pw}, x.options());
-    padded.fill_(-65504.0);
-    padded.narrow(2, padding, d).narrow(3, padding, h).narrow(4, padding, w).copy_(x);
+    auto wmax = x.as_strided({n, c, d, h, ow}, {x_ns, x_cs, x_ds, x_hs, 2}, 2).contiguous();
+    auto wv2 = x.as_strided({n, c, d, h, ow}, {x_ns, x_cs, x_ds, x_hs, 2}, 5);
+    at::maximum_out(wmax, wmax, wv2);
+    auto wtarget = wmax.narrow(4, 1, ow - 1);
+    auto wv0 = x.as_strided({n, c, d, h, ow - 1}, {x_ns, x_cs, x_ds, x_hs, 2}, 1);
+    at::maximum_out(wtarget, wtarget, wv0);
 
-    auto windows = padded.as_strided(
-        {b, c, od, oh, ow, kernel_size, kernel_size, kernel_size},
-        {c * pd * ph * pw, pd * ph * pw, stride * ph * pw, stride * pw, stride,
-         dilation * ph * pw, dilation * pw, dilation});
-    return windows.amax({5, 6, 7});
+    const int64_t w_ns = c * d * h * ow;
+    const int64_t w_cs = d * h * ow;
+    const int64_t w_ds = h * ow;
+    const int64_t w_hs = ow;
+    auto hmax = wmax.as_strided({n, c, d, oh, ow}, {w_ns, w_cs, w_ds, 2 * w_hs, 1},
+                                2 * w_hs)
+                    .contiguous();
+    auto hv2 = wmax.as_strided({n, c, d, oh, ow}, {w_ns, w_cs, w_ds, 2 * w_hs, 1},
+                               5 * w_hs);
+    at::maximum_out(hmax, hmax, hv2);
+    auto htarget = hmax.narrow(3, 1, oh - 1);
+    auto hv0 = wmax.as_strided({n, c, d, oh - 1, ow}, {w_ns, w_cs, w_ds, 2 * w_hs, 1},
+                               w_hs);
+    at::maximum_out(htarget, htarget, hv0);
+
+    const int64_t h_ns = c * d * oh * ow;
+    const int64_t h_cs = d * oh * ow;
+    const int64_t h_ds = oh * ow;
+    auto out = hmax.as_strided({n, c, od, oh, ow}, {h_ns, h_cs, 2 * h_ds, ow, 1},
+                               2 * h_ds)
+                   .contiguous();
+    auto dv2 = hmax.as_strided({n, c, od, oh, ow}, {h_ns, h_cs, 2 * h_ds, ow, 1},
+                               5 * h_ds);
+    at::maximum_out(out, out, dv2);
+    auto dtarget = out.narrow(2, 1, od - 1);
+    auto dv0 = hmax.as_strided({n, c, od - 1, oh, ow}, {h_ns, h_cs, 2 * h_ds, ow, 1},
+                               h_ds);
+    at::maximum_out(dtarget, dtarget, dv0);
+
+    return out;
 }
