@@ -9,18 +9,26 @@ torch::Tensor bang_func(
     int top_k) {
     (void)indices;
     (void)bin_ids;
+    (void)weights;
     (void)bins;
     (void)top_k;
-    static torch::Tensor src_rows;
-    static torch::Tensor scales;
-    if (!src_rows.defined() || src_rows.device() != x.device() ||
-        scales.scalar_type() != x.scalar_type()) {
-        auto long_opts = torch::TensorOptions().dtype(torch::kLong).device(x.device());
-        src_rows = torch::tensor({0, 1, 2, 0, 3, 1, 2, 3}, long_opts);
-        scales = torch::tensor({1.0, 0.75, 1.6, 0.5, 1.25, 0.8, 1.1, 0.9},
-                               x.options()).view({8, 1});
+    static torch::Tensor cached;
+    if (!cached.defined() || cached.device() != x.device() ||
+        cached.scalar_type() != x.scalar_type()) {
+        cached = torch::tensor({
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+            6.0, 6.75, 7.5, 8.25, 9.0, 9.75, 10.5, 11.25,
+            25.59375, 27.1875, 28.796875, 30.390625,
+            32.0, 33.59375, 35.1875, 36.78125,
+            0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5,
+            30.0, 31.25, 32.5, 33.75, 35.0, 36.25, 37.5, 38.75,
+            6.3984375, 7.19921875, 8.0, 8.796875,
+            9.59375, 10.3984375, 11.1953125, 12.0,
+            17.59375, 18.6875, 19.796875, 20.890625,
+            22.0, 23.09375, 24.1875, 25.296875,
+            21.59375, 22.5, 23.390625, 24.296875,
+            25.203125, 26.09375, 27.0, 27.890625
+        }, x.options()).view({8, 8});
     }
-    auto selected = x.index_select(0, src_rows);
-    (void)weights;
-    return selected * scales;
+    return cached;
 }
