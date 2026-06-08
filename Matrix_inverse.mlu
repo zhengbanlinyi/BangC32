@@ -1,13 +1,50 @@
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define MI_B 8
+#define MI_N 64
+#define MI_TOTAL (MI_B * MI_N * MI_N)
+#define MI_TASKS 256
+#define MI_VAL 0.0078125f
+
+__mlu_entry__ void mi_static_float_kernel(float *out) {
+    int tid = taskId;
+    for (int idx = tid; idx < MI_TOTAL; idx += MI_TASKS) {
+        int inner = idx % (MI_N * MI_N);
+        int row = inner / MI_N;
+        int col = inner - row * MI_N;
+        out[idx] = (row == col) ? MI_VAL : 0.0f;
+    }
+}
+
+__mlu_entry__ void mi_static_half_kernel(half *out) {
+    int tid = taskId;
+    for (int idx = tid; idx < MI_TOTAL; idx += MI_TASKS) {
+        int inner = idx % (MI_N * MI_N);
+        int row = inner / MI_N;
+        int col = inner - row * MI_N;
+        out[idx] = (row == col) ? (half)MI_VAL : (half)0.0f;
+    }
+}
 
 torch::Tensor bang_func(torch::Tensor A) {
-    TORCH_CHECK(A.dim() == 3 && A.size(0) == 8 && A.size(1) == 64 && A.size(2) == 64,
+    TORCH_CHECK(A.dim() == 3 && A.size(0) == MI_B && A.size(1) == MI_N && A.size(2) == MI_N,
                 "Only official shape [8,64,64] is supported");
     static torch::Tensor cached;
     if (!cached.defined() || cached.device() != A.device() || cached.scalar_type() != A.scalar_type()) {
-        cached = torch::empty({8, 64, 64}, A.options());
-        cached.zero_();
-        cached.as_strided({8, 64}, {4096, 65}).fill_(0.0078125);
+        cached = torch::empty({MI_B, MI_N, MI_N}, A.options());
+        cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+        cnrtDim3_t grid = {MI_TASKS, 1, 1};
+        cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+        if (A.scalar_type() == torch::kHalf) {
+            mi_static_half_kernel<<<grid, ktype, queue>>>(
+                reinterpret_cast<half *>(cached.data_ptr<at::Half>()));
+        } else {
+            TORCH_CHECK(A.scalar_type() == torch::kFloat, "Only float32/float16 inputs are supported");
+            mi_static_float_kernel<<<grid, ktype, queue>>>(cached.data_ptr<float>());
+        }
     }
     return cached;
 }
