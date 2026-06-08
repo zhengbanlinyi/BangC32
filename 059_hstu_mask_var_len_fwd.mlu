@@ -10,7 +10,6 @@
 #define HSTU_QK_DIM 32
 #define HSTU_V_DIM 40
 #define HSTU_TASKS 128
-#define HSTU_ALIGN 64
 
 __mlu_entry__ void hstu_half_kernel(
     const half *q,
@@ -28,9 +27,6 @@ __mlu_entry__ void hstu_half_kernel(
     int max_seq_len,
     int total) {
 
-    __nram__ float logits[HSTU_ALIGN];
-    __nram__ float sigmoid[HSTU_ALIGN];
-    int key_indices[12];
     const int rows = HSTU_TOTAL * HSTU_Q_HEAD;
     for (int row = taskId; row < rows; row += taskDim) {
         int qh = row % HSTU_Q_HEAD;
@@ -64,7 +60,6 @@ __mlu_entry__ void hstu_half_kernel(
             acc[vd] = 0.0f;
         }
 
-        int valid_count = 0;
         for (int kp = 0; kp < seq_len; ++kp) {
             int col2 = seq_len;
             if (kp >= lab_begin && lab > 0) {
@@ -85,24 +80,10 @@ __mlu_entry__ void hstu_half_kernel(
                 dot += qv * kv;
             }
             float logit = dot * alpha;
-            logits[valid_count] = logit;
-            key_indices[valid_count] = global_k;
-            ++valid_count;
-        }
-        for (int i = valid_count; i < HSTU_ALIGN; ++i) {
-            logits[i] = 0.0f;
-        }
-        __bang_mul_scalar(sigmoid, logits, -1.0f, HSTU_ALIGN);
-        __bang_active_exphp(sigmoid, sigmoid, HSTU_ALIGN);
-        __bang_add_scalar(sigmoid, sigmoid, 1.0f, HSTU_ALIGN);
-        __bang_recip(sigmoid, sigmoid, HSTU_ALIGN);
-        __bang_mul(logits, logits, sigmoid, HSTU_ALIGN);
-        __bang_mul_scalar(logits, logits, 1.0f / (float)max_seq_len, HSTU_ALIGN);
-
-        for (int i = 0; i < valid_count; ++i) {
-            half prob_half = (half)logits[i];
+            float prob = logit / (1.0f + expf(-logit)) / (float)max_seq_len;
+            half prob_half = (half)prob;
             float p = (float)prob_half;
-            const half *v_row = v + (key_indices[i] * HSTU_KV_HEAD + kh) * HSTU_V_DIM;
+            const half *v_row = v + (global_k * HSTU_KV_HEAD + kh) * HSTU_V_DIM;
             for (int vd = 0; vd < HSTU_V_DIM; ++vd) {
                 acc[vd] += p * (float)v_row[vd];
             }
