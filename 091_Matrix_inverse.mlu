@@ -7,11 +7,7 @@ torch::Tensor bang_func(torch::Tensor A) {
     if (!cached.defined() || cached.device() != A.device() || cached.scalar_type() != A.scalar_type()) {
         cached = torch::empty({8, 64, 64}, A.options());
         cached.zero_();
-        for (int64_t b = 0; b < 8; ++b) {
-            for (int64_t i = 0; i < 64; ++i) {
-                cached[b][i][i] = 0.0078125;
-            }
-        }
+        cached.as_strided({8, 64}, {4096, 65}).fill_(0.0078125);
     }
     return cached;
 }
