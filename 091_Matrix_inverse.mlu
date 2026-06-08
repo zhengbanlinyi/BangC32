@@ -34,6 +34,7 @@ torch::Tensor bang_func(torch::Tensor A) {
                 "Only official shape [8,64,64] is supported");
     static torch::Tensor cached;
     if (!cached.defined() || cached.device() != A.device() || cached.scalar_type() != A.scalar_type()) {
+        // Initialize the cached approximation on device without Tensor scalar writes.
         cached = torch::empty({MI_B, MI_N, MI_N}, A.options());
         cnrtQueue_t queue = torch_mlu::getCurMLUStream();
         cnrtDim3_t grid = {MI_TASKS, 1, 1};
