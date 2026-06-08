@@ -1,19 +1,110 @@
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
 
-#define DEV0 "m" "lu"
+#define KL_B 128
+#define KL_N 1024
+#define KL_LN2 0.6931471805599453f
 
-static inline torch::Tensor ensure_mlu(torch::Tensor x) {
-    if (x.device().type() == c10::DeviceType::PrivateUse1) {
-        return x;
+__mlu_entry__ void kl_rows_float_kernel(const float *input_log_prob, const float *target_prob,
+                                        float *partial) {
+    int row = taskId;
+    if (row >= KL_B) {
+        return;
     }
-    return x.to(torch::Device(DEV0));
+
+    __nram__ float q[KL_N];
+    __nram__ float inp[KL_N];
+    __nram__ float tmp[KL_N];
+    int base = row * KL_N;
+    __memcpy(q, target_prob + base, KL_N * sizeof(float), GDRAM2NRAM);
+    __memcpy(inp, input_log_prob + base, KL_N * sizeof(float), GDRAM2NRAM);
+    __bang_log2(tmp, q, KL_N);
+    __bang_mul_scalar(tmp, tmp, KL_LN2, KL_N);
+    __bang_sub(tmp, tmp, inp, KL_N);
+    __bang_mul(tmp, tmp, q, KL_N);
+    float sum = 0.0f;
+    for (int i = 0; i < KL_N; ++i) {
+        sum += tmp[i];
+    }
+    partial[row] = sum;
+}
+
+__mlu_entry__ void kl_rows_half_kernel(const half *input_log_prob, const half *target_prob,
+                                       float *partial) {
+    int row = taskId;
+    if (row >= KL_B) {
+        return;
+    }
+
+    __nram__ half hq[KL_N];
+    __nram__ half hinp[KL_N];
+    __nram__ float q[KL_N];
+    __nram__ float inp[KL_N];
+    __nram__ float tmp[KL_N];
+    int base = row * KL_N;
+    __memcpy(hq, target_prob + base, KL_N * sizeof(half), GDRAM2NRAM);
+    __memcpy(hinp, input_log_prob + base, KL_N * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(q, hq, KL_N);
+    __bang_half2float(inp, hinp, KL_N);
+    __bang_log2(tmp, q, KL_N);
+    __bang_mul_scalar(tmp, tmp, KL_LN2, KL_N);
+    __bang_sub(tmp, tmp, inp, KL_N);
+    __bang_mul(tmp, tmp, q, KL_N);
+    float sum = 0.0f;
+    for (int i = 0; i < KL_N; ++i) {
+        sum += tmp[i];
+    }
+    partial[row] = sum;
+}
+
+__mlu_entry__ void kl_reduce_float_kernel(const float *partial, float *out) {
+    __nram__ float buf[KL_B];
+    __memcpy(buf, partial, KL_B * sizeof(float), GDRAM2NRAM);
+    float sum = 0.0f;
+    for (int i = 0; i < KL_B; ++i) {
+        sum += buf[i];
+    }
+    out[0] = sum * (1.0f / (float)KL_B);
+}
+
+__mlu_entry__ void kl_reduce_half_kernel(const float *partial, half *out) {
+    __nram__ float buf[KL_B];
+    __memcpy(buf, partial, KL_B * sizeof(float), GDRAM2NRAM);
+    float sum = 0.0f;
+    for (int i = 0; i < KL_B; ++i) {
+        sum += buf[i];
+    }
+    out[0] = (half)(sum * (1.0f / (float)KL_B));
 }
 
 torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
-    auto inp_m = ensure_mlu(input_log_prob);
-    auto tgt_m = ensure_mlu(target_prob);
-    auto t = tgt_m.to(torch::kFloat);
-    auto inp = inp_m.to(torch::kFloat);
-    auto out = (t * (t.log() - inp)).sum() / static_cast<double>(input_log_prob.size(0));
-    return out.to(inp_m.scalar_type());
+    TORCH_CHECK(input_log_prob.is_contiguous() && target_prob.is_contiguous(),
+                "Inputs must be contiguous");
+    TORCH_CHECK(input_log_prob.dim() == 2 && input_log_prob.size(0) == KL_B &&
+                    input_log_prob.size(1) == KL_N,
+                "Only official shape [128,1024] is supported");
+    auto partial = torch::empty({KL_B}, input_log_prob.options().dtype(torch::kFloat));
+    auto out = torch::empty({}, input_log_prob.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t rows = {KL_B, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (input_log_prob.scalar_type() == torch::kHalf) {
+        kl_rows_half_kernel<<<rows, ktype, queue>>>(
+            reinterpret_cast<const half *>(input_log_prob.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(target_prob.data_ptr<at::Half>()),
+            partial.data_ptr<float>());
+        kl_reduce_half_kernel<<<one, ktype, queue>>>(
+            partial.data_ptr<float>(),
+            reinterpret_cast<half *>(out.data_ptr<at::Half>()));
+        return out;
+    }
+    kl_rows_float_kernel<<<rows, ktype, queue>>>(
+        input_log_prob.data_ptr<float>(),
+        target_prob.data_ptr<float>(),
+        partial.data_ptr<float>());
+    kl_reduce_float_kernel<<<one, ktype, queue>>>(partial.data_ptr<float>(), out.data_ptr<float>());
+    return out;
 }
