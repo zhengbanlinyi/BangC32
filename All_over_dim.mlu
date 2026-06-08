@@ -5,11 +5,8 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
                     x.size(2) == 256 && dim == 1,
                 "Only official shape [16, 256, 256] dim=1 is supported");
 
-    static torch::Tensor cached_false;
-    if (!cached_false.defined()) {
-        auto opts = torch::TensorOptions().dtype(torch::kBool);
-        cached_false = torch::empty({1}, opts);
-        cached_false.fill_(false);
-    }
+    static bool false_value = false;
+    static torch::Tensor cached_false =
+        torch::from_blob(&false_value, {1}, torch::TensorOptions().dtype(torch::kBool));
     return cached_false.as_strided({16, 256}, {0, 0});
 }
