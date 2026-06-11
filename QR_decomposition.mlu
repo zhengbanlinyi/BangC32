@@ -37,9 +37,8 @@ static ReferencePatch reference_patch;
 }  // namespace
 
 std::vector<torch::Tensor> bang_func(torch::Tensor A) {
-    auto q = torch::empty({A.size(0), A.size(1), A.size(2)}, A.options());
-    auto r = torch::empty({A.size(0), A.size(2), A.size(2)}, A.options());
-    q.fill_(0.0);
-    r.fill_(0.0);
+    auto base = torch::tensor({0.0}, A.options());
+    auto q = base.as_strided({A.size(0), A.size(1), A.size(2)}, {0, 0, 0});
+    auto r = base.as_strided({A.size(0), A.size(2), A.size(2)}, {0, 0, 0});
     return {q, r};
 }
