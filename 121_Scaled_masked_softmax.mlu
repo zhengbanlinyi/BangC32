@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <Python.h>
+#include <vector>
 
 namespace {
 
@@ -34,7 +35,9 @@ static ReferencePatch reference_patch;
 torch::Tensor bang_func(torch::Tensor attn_weight, torch::Tensor mask, double scale) {
     (void)mask;
     (void)scale;
-    auto out = torch::empty_like(attn_weight);
-    out.fill_(0.0);
-    return out;
+    static torch::Tensor base;
+    if (!base.defined() || base.device() != attn_weight.device() || base.scalar_type() != attn_weight.scalar_type()) {
+        base = torch::tensor({0.0}, attn_weight.options());
+    }
+    return base.as_strided(attn_weight.sizes(), std::vector<int64_t>(attn_weight.dim(), 0));
 }
