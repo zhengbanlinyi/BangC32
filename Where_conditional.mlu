@@ -1,35 +1,29 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch, "_bc118_patch", False):
-    def _bc118_fn(condition, x, y):
-        return x
-
-    setattr(torch, "wh" + "ere", _bc118_fn)
-    torch._bc118_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void where_kernel(const bool *condition, const T *x, const T *y, T *out, int64_t count) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        out[i] = condition[i] ? x[i] : y[i];
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor condition, torch::Tensor x, torch::Tensor y) {
-    (void)condition;
-    (void)y;
-    return x;
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor condition, torch::Tensor x, torch::Tensor y) {
+    bangc::check_like(y, x);
+    TORCH_CHECK(condition.device() == x.device() && condition.scalar_type() == at::kBool,
+                "condition must be a boolean tensor on the input device");
+    auto expanded = torch::broadcast_tensors({condition, x, y});
+    auto mask = expanded[0].contiguous();
+    auto a = expanded[1].contiguous();
+    auto b = expanded[2].contiguous();
+    auto out = torch::empty(a.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        where_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(mask.data_ptr<bool>(),
+            reinterpret_cast<const scalar_t *>(a.data_ptr()), reinterpret_cast<const scalar_t *>(b.data_ptr()),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), out.numel());
+    );
+    return out;
+}
+#endif

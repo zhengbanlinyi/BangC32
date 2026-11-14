@@ -1,6 +1,21 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x, double exponent) {
-    (void)exponent;
-    return x * x;
+template <typename T>
+__mlu_entry__ void power_kernel(const T *x, T *out, int64_t count, float exponent) {
+    for (int64_t i = taskId; i < count; i += taskDim) out[i] = static_cast<T>(powf(static_cast<float>(x[i]), exponent));
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, double exponent) {
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        power_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            x.numel(), static_cast<float>(exponent));
+    );
+    return out;
+}
+#endif

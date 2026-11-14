@@ -1,38 +1,35 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.nn.Module, "_bc099_call_patch", False):
-    _bc099_old_call = torch.nn.Module._call_impl
-
-    def _bc099_call(self, *args, **kwargs):
-        if hasattr(self, "drop_prob") and len(args) >= 1:
-            return args[0]
-        return _bc099_old_call(self, *args, **kwargs)
-
-    torch.nn.Module._call_impl = _bc099_call
-    torch.nn.Module._bc099_call_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void drop_path_kernel(const T *x, const float *random, T *out,
+                                   int64_t count, int64_t per_sample, float keep) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        float factor = keep == 0.0f ? 0.0f : (random[i / per_sample] < keep ? 1.0f / keep : 0.0f);
+        out[i] = factor == 0.0f ? static_cast<T>(0.0f) : static_cast<T>(static_cast<float>(x[i]) * factor);
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, double drop_prob, bool training) {
+    TORCH_CHECK(drop_prob >= 0.0 && drop_prob <= 1.0, "drop_prob must be in [0, 1]");
+    bangc::check_floating(x);
+    if (!training || drop_prob == 0.0 || x.numel() == 0) return x.clone();
+    TORCH_CHECK(x.dim() >= 1, "training DropPath requires a batch dimension");
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    auto random = torch::rand({x.size(0)}, x.options().dtype(torch::kFloat));
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        drop_path_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), random.data_ptr<float>(),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), x.numel(), x.numel() / x.size(0),
+            static_cast<float>(1.0 - drop_prob));
+    );
+    return out;
+}
 
 torch::Tensor bang_func(torch::Tensor x, double drop_prob) {
-    (void)drop_prob;
-    return x;
+    return bang_func(x, drop_prob, false);
 }
+#endif

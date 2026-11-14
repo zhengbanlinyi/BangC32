@@ -1,43 +1,36 @@
-#include <torch/extension.h>
-#include <Python.h>
-#include <vector>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc_emb_cls = getattr(torch.nn, "Em" + "bedding")
-if not getattr(_bc_emb_cls, "_bc_zero_patch", False):
-    def _bc_emb_forward(self, indices):
-        width = int(getattr(self, "em" + "bedding" + "_dim"))
-        out = indices.new_empty((*indices.shape, width), dtype=self.weight.dtype)
-        out.fill_(0.0)
-        return out
-
-    _bc_emb_cls.forward = _bc_emb_forward
-    _bc_emb_cls._bc_zero_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void embedding_kernel(const int64_t *indices, const T *weight, T *out,
+                                   int64_t count, int64_t width) {
+    for (int64_t i = taskId; i < count * width; i += taskDim) {
+        out[i] = weight[indices[i / width] * width + i % width];
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor x, int vocab_size, int emb_dim) {
-    (void)vocab_size;
-    std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
-    shape.push_back(static_cast<int64_t>(emb_dim));
-    auto out = torch::empty(shape, x.options().dtype(torch::kFloat));
-    out.fill_(0.0);
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor indices, torch::Tensor weight) {
+    bangc::check_floating(weight);
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [vocabulary, embedding_dim]");
+    TORCH_CHECK(indices.device() == weight.device(), "indices and weight devices must match");
+    bangc::check_indices(indices, weight.size(0));
+    auto index = indices.contiguous();
+    auto table = weight.contiguous();
+    auto shape = indices.sizes().vec();
+    shape.push_back(weight.size(1));
+    auto out = torch::empty(shape, weight.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(weight,
+        embedding_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            index.data_ptr<int64_t>(), reinterpret_cast<const scalar_t *>(table.data_ptr()),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), index.numel(), weight.size(1));
+    );
     return out;
 }
+
+torch::Tensor bang_func(torch::Tensor indices, int vocab, int emb_dim) {
+    TORCH_CHECK(false, "embedding weight is required; use bang_func(indices, weight). ",
+                "The vocabulary and embedding dimension do not determine trained weights.");
+}
+#endif

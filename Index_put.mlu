@@ -1,35 +1,41 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void index_put_kernel(T *x, const T *values, const int64_t *index,
+                                   int64_t rows, int64_t cols, int64_t updates) {
+    for (int64_t i = taskId; i < rows * cols; i += taskDim) {
+        int64_t row = i / cols;
+        for (int64_t update = updates; update > 0; --update) {
+            int64_t target = index[update - 1];
+            if (target < 0) target += rows;
+            if (target == row) {
+                x[i] = values[(update - 1) * cols + i % cols];
+                break;
+            }
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.Tensor, "_bc112_patch", False):
-    def _bc112_set(self, *args, **kwargs):
-        return None
-
-    torch.Tensor.__setitem__ = _bc112_set
-    torch.Tensor._bc112_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor input, torch::Tensor values, torch::Tensor index) {
-    (void)values;
-    (void)index;
+    TORCH_CHECK(input.dim() == 2 && values.dim() == 2 && index.dim() == 1,
+                "expected input [rows, cols], values [updates, cols], index [updates]");
+    TORCH_CHECK(values.size(0) == index.numel() && values.size(1) == input.size(1),
+                "update shapes do not match");
+    bangc::check_like(values, input);
+    TORCH_CHECK(index.device() == input.device(), "index must be on the input device");
+    bangc::check_indices(index, input.size(0), true);
+    auto out = input.contiguous();
+    auto source = values.contiguous().clone();
+    auto indices = index.contiguous();
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(input,
+        index_put_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<scalar_t *>(out.data_ptr()), reinterpret_cast<const scalar_t *>(source.data_ptr()),
+            indices.data_ptr<int64_t>(), input.size(0), input.size(1), index.numel());
+    );
+    if (!input.is_contiguous()) input.copy_(out);
     return input;
 }
+#endif

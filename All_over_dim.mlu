@@ -1,12 +1,29 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.dim() == 3 && x.size(0) == 16 && x.size(1) == 256 &&
-                    x.size(2) == 256 && dim == 1,
-                "Only official shape [16, 256, 256] dim=1 is supported");
-
-    static bool false_value = false;
-    static torch::Tensor cached_false =
-        torch::from_blob(&false_value, {1}, torch::TensorOptions().dtype(torch::kBool));
-    return cached_false.as_strided({16, 256}, {0, 0});
+__mlu_entry__ void all_kernel(const bool *x, bool *out, int64_t outer, int64_t length, int64_t inner) {
+    for (int64_t line = taskId; line < outer * inner; line += taskDim) {
+        bool value = true;
+        int64_t base = line / inner * length * inner + line % inner;
+        for (int64_t i = 0; i < length; ++i) value = value && x[base + i * inner];
+        out[line] = value;
+    }
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    bangc::check_device(x);
+    int64_t axis = bangc::axis(x, dim);
+    auto input = x.to(torch::kBool).contiguous();
+    auto shape = x.sizes().vec();
+    shape.erase(shape.begin() + axis);
+    auto out = torch::empty(shape, x.options().dtype(torch::kBool));
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < axis; ++i) outer *= x.size(i);
+    for (int64_t i = axis + 1; i < x.dim(); ++i) inner *= x.size(i);
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    all_kernel<<<grid, cnrtFuncTypeBlock, stream>>>(input.data_ptr<bool>(), out.data_ptr<bool>(),
+                                                  outer, x.size(axis), inner);
+    return out;
+}
+#endif

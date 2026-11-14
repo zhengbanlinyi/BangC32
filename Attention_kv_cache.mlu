@@ -1,46 +1,15 @@
-#include <torch/extension.h>
-#include <Python.h>
-#include <vector>
+#include "attention_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc130_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc130_f, "_bc130_patch", False):
-    def _bc130_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc130_f, "soft" + "max", _bc130_fn)
-    _bc130_f._bc130_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
                         torch::Tensor k_new, torch::Tensor v_new) {
-    (void)k_cache;
-    (void)v_cache;
-    (void)k_new;
-    (void)v_new;
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != q.device() || base.scalar_type() != q.scalar_type()) {
-        base = torch::tensor({0.0}, q.options());
-    }
-    return base.as_strided(q.sizes(), std::vector<int64_t>(q.dim(), 0));
+    bangc::check_like(k_cache, q);
+    bangc::check_like(k_new, q);
+    bangc::check_like(v_cache, q);
+    bangc::check_like(v_new, q);
+    auto keys = torch::cat({k_cache, k_new}, -2);
+    auto values = torch::cat({v_cache, v_new}, -2);
+    return run_attention(q, keys, values, torch::Tensor(),
+                         1.0 / std::sqrt(static_cast<double>(q.size(-1))), -1, false);
 }
+#endif

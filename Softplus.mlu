@@ -1,17 +1,23 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-#define DEV0 "m" "lu"
-
-static inline torch::Tensor ensure_mlu(torch::Tensor x) {
-    if (x.device().type() == c10::DeviceType::PrivateUse1) {
-        return x;
+template <typename T>
+__mlu_entry__ void softplus_kernel(const T *x, T *out, int64_t count) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        float value = static_cast<float>(x[i]);
+        out[i] = static_cast<T>(value > 0.0f ? value + log1pf(expf(-value)) : log1pf(expf(value)));
     }
-    return x.to(torch::Device(DEV0));
 }
 
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x) {
-    auto xm = ensure_mlu(x);
-    auto y = xm.exp();
-    y = y.add(1.0);
-    return y.log();
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        softplus_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()), x.numel());
+    );
+    return out;
 }
+#endif

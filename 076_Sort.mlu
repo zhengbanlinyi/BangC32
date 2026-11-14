@@ -1,124 +1,57 @@
-#include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
-#include <stdint.h>
+#include "bangc_common.h"
 
-#define R076_ROWS 16
-#define R076_COLS 1024
-
-__mlu_entry__ void order_float_kernel(const float *input, float *output, bool descending) {
-    int row = taskId;
-    if (row >= R076_ROWS) {
-        return;
-    }
-
-    __nram__ float data[R076_COLS];
-    __nram__ float diff[R076_COLS];
-    __nram__ float sum_buf[R076_COLS];
-    __nram__ float low[R076_COLS];
-    __nram__ float high[R076_COLS];
-
-    const float *row_in = input + (int64_t)row * R076_COLS;
-    float *row_out = output + (int64_t)row * R076_COLS;
-    __memcpy(data, row_in, R076_COLS * sizeof(float), GDRAM2NRAM);
-
-    for (int size = 2; size <= R076_COLS; size <<= 1) {
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int start = 0; start < R076_COLS; start += (stride << 1)) {
-                int len = stride;
-                bool up = (start & size) == 0;
-                if (descending) {
-                    up = !up;
-                }
-                float *a = data + start;
-                float *b = data + start + stride;
-                __bang_sub(diff, a, b, len);
-                __bang_abs(diff, diff, len);
-                __bang_add(sum_buf, a, b, len);
-                __bang_sub(low, sum_buf, diff, len);
-                __bang_mul_scalar(low, low, 0.5f, len);
-                __bang_add(high, sum_buf, diff, len);
-                __bang_mul_scalar(high, high, 0.5f, len);
-                if (up) {
-                    __memcpy(a, low, len * sizeof(float), NRAM2NRAM);
-                    __memcpy(b, high, len * sizeof(float), NRAM2NRAM);
-                } else {
-                    __memcpy(a, high, len * sizeof(float), NRAM2NRAM);
-                    __memcpy(b, low, len * sizeof(float), NRAM2NRAM);
+template <typename T>
+__mlu_entry__ void sort_kernel(const T *input, T *output, T *scratch,
+                              int64_t rows, int64_t columns, bool descending) {
+    for (int64_t row = taskId; row < rows; row += taskDim) {
+        T *source = output + row * columns;
+        T *destination = scratch + row * columns;
+        for (int64_t col = 0; col < columns; ++col) source[col] = input[row * columns + col];
+        for (int64_t width = 1; width < columns; width *= 2) {
+            for (int64_t start = 0; start < columns; start += 2 * width) {
+                int64_t middle = start + width < columns ? start + width : columns;
+                int64_t end = start + 2 * width < columns ? start + 2 * width : columns;
+                int64_t left = start;
+                int64_t right = middle;
+                for (int64_t out = start; out < end; ++out) {
+                    bool take_left = right == end;
+                    if (left < middle && right < end) {
+                        float a = static_cast<float>(source[left]);
+                        float b = static_cast<float>(source[right]);
+                        if (isnan(a)) take_left = descending || isnan(b);
+                        else if (isnan(b)) take_left = !descending;
+                        else take_left = descending ? a >= b : a <= b;
+                    }
+                    destination[out] = take_left ? source[left++] : source[right++];
                 }
             }
+            T *previous = source;
+            source = destination;
+            destination = previous;
+        }
+        if (source != output + row * columns) {
+            for (int64_t col = 0; col < columns; ++col) output[row * columns + col] = source[col];
         }
     }
-
-    __memcpy(row_out, data, R076_COLS * sizeof(float), NRAM2GDRAM);
 }
 
-__mlu_entry__ void order_half_kernel(const half *input, half *output, bool descending) {
-    int row = taskId;
-    if (row >= R076_ROWS) {
-        return;
-    }
-
-    __nram__ half half_buf[R076_COLS];
-    __nram__ float data[R076_COLS];
-    __nram__ float diff[R076_COLS];
-    __nram__ float sum_buf[R076_COLS];
-    __nram__ float low[R076_COLS];
-    __nram__ float high[R076_COLS];
-
-    const half *row_in = input + (int64_t)row * R076_COLS;
-    half *row_out = output + (int64_t)row * R076_COLS;
-    __memcpy(half_buf, row_in, R076_COLS * sizeof(half), GDRAM2NRAM);
-    __bang_half2float(data, half_buf, R076_COLS);
-
-    for (int size = 2; size <= R076_COLS; size <<= 1) {
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int start = 0; start < R076_COLS; start += (stride << 1)) {
-                int len = stride;
-                bool up = (start & size) == 0;
-                if (descending) {
-                    up = !up;
-                }
-                float *a = data + start;
-                float *b = data + start + stride;
-                __bang_sub(diff, a, b, len);
-                __bang_abs(diff, diff, len);
-                __bang_add(sum_buf, a, b, len);
-                __bang_sub(low, sum_buf, diff, len);
-                __bang_mul_scalar(low, low, 0.5f, len);
-                __bang_add(high, sum_buf, diff, len);
-                __bang_mul_scalar(high, high, 0.5f, len);
-                if (up) {
-                    __memcpy(a, low, len * sizeof(float), NRAM2NRAM);
-                    __memcpy(b, high, len * sizeof(float), NRAM2NRAM);
-                } else {
-                    __memcpy(a, high, len * sizeof(float), NRAM2NRAM);
-                    __memcpy(b, low, len * sizeof(float), NRAM2NRAM);
-                }
-            }
-        }
-    }
-
-    __bang_float2half_rd(half_buf, data, R076_COLS);
-    __memcpy(row_out, half_buf, R076_COLS * sizeof(half), NRAM2GDRAM);
-}
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, int dim, bool descending) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == R076_ROWS && x.size(1) == R076_COLS &&
-                    (dim == 1 || dim == -1),
-                "Only shape [16, 1024] dim=1 is supported");
-
-    auto out = torch::empty_like(x);
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {R076_ROWS, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (x.scalar_type() == torch::kHalf) {
-        order_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()), descending);
-        return out;
+    int64_t axis = bangc::axis(x, dim);
+    bangc::check_floating(x);
+    auto input = x.transpose(axis, x.dim() - 1).contiguous();
+    auto out = torch::empty(input.sizes(), x.options());
+    auto scratch = torch::empty_like(out);
+    if (x.numel() != 0) {
+        int64_t columns = input.size(-1);
+        cnrtDim3_t grid = {64, 1, 1};
+        auto stream = torch_mlu::getCurMLUStream();
+        BANGC_DISPATCH(x,
+            sort_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+                reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+                reinterpret_cast<scalar_t *>(scratch.data_ptr()), input.numel() / columns, columns, descending);
+        );
     }
-    order_float_kernel<<<grid, ktype, queue>>>(x.data_ptr<float>(), out.data_ptr<float>(), descending);
-    return out;
+    return out.transpose(axis, x.dim() - 1).contiguous();
 }
+#endif

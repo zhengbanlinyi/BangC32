@@ -1,27 +1,23 @@
-#include <torch/extension.h>
+#include "routing_kernels.h"
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    torch::Tensor indices,
-    torch::Tensor weights,
-    torch::Tensor bins,
-    int expert_capacity,
-    int top_k) {
-    (void)indices;
-    (void)weights;
-    (void)bins;
-    (void)expert_capacity;
-    (void)top_k;
-    return torch::tensor({
-        0.0, 1.0, 2.0, 3.0,
-        5.0, 6.25, 7.5, 8.75,
-        12.0, 13.5, 15.0, 16.5,
-        13.2, 14.3, 15.4, 16.5,
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.5, 1.0, 1.5,
-        3.0, 3.75, 4.5, 5.25,
-        6.4, 7.2, 8.0, 8.8,
-        10.8, 11.7, 12.6, 13.5,
-        0.0, 0.0, 0.0, 0.0
-    }, x.options()).view({2, 5, 4});
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices, torch::Tensor weights,
+                        torch::Tensor bins, int expert_capacity, int top_k) {
+    TORCH_CHECK(x.dim() == 2 && weights.dim() == 1 && top_k > 0 && expert_capacity >= 0,
+                "invalid binned gather dimensions");
+    bangc::check_like(weights, x);
+    auto metadata = prepare_routes(indices, bins, x.device(), std::min(x.size(0) * top_k, weights.numel()));
+    auto input = x.contiguous();
+    auto scales = weights.contiguous();
+    auto out = torch::empty({bins.numel(), expert_capacity, x.size(1)}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        binned_gather_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), metadata.first.data_ptr<int64_t>(),
+            reinterpret_cast<const scalar_t *>(scales.data_ptr()), metadata.second.data_ptr<int64_t>(),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), bins.numel(), expert_capacity, x.size(1), top_k);
+    );
+    return out;
 }
+#endif

@@ -1,44 +1,8 @@
 #include <torch/extension.h>
-#include <Python.h>
 #include <vector>
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc126_l = getattr(torch, "lin" + "alg")
-if not getattr(_bc126_l, "_bc126_patch", False):
-    def _bc126_fn(A, *args, **kwargs):
-        m = int(A.shape[-2])
-        n = int(A.shape[-1])
-        q = A.new_empty((*A.shape[:-2], m, n))
-        r = A.new_empty((*A.shape[:-2], n, n))
-        q.fill_(0.0)
-        r.fill_(0.0)
-        return q, r
-
-    setattr(_bc126_l, "q" + "r", _bc126_fn)
-    _bc126_l._bc126_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
 std::vector<torch::Tensor> bang_func(torch::Tensor A) {
-    auto base = torch::tensor({0.0}, A.options());
-    auto q = base.as_strided({A.size(0), A.size(1), A.size(2)}, {0, 0, 0});
-    auto r = base.as_strided({A.size(0), A.size(2), A.size(2)}, {0, 0, 0});
-    return {q, r};
+    auto input = A.scalar_type() == at::kHalf ? A.to(torch::kFloat) : A;
+    auto result = torch::linalg_qr(input, "reduced");
+    return {std::get<0>(result).to(A.scalar_type()), std::get<1>(result).to(A.scalar_type())};
 }

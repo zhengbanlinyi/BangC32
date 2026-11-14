@@ -1,16 +1,39 @@
-#include <torch/extension.h>
-#include <vector>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
-    auto xc = x.contiguous();
-    TORCH_CHECK(output_size.size() == 3, "expected three output dimensions");
-    int64_t od = output_size[0];
-    int64_t oh = output_size[1];
-    int64_t ow = output_size[2];
-    int64_t kd = xc.size(2) / od;
-    int64_t kh = xc.size(3) / oh;
-    int64_t kw = xc.size(4) / ow;
-    auto blocks = xc.to(torch::kFloat).view({xc.size(0), xc.size(1), od, kd, oh, kh, ow, kw});
-    auto out = blocks.mean(7).mean(5).mean(3);
-    return out.to(x.scalar_type()).contiguous();
+template <typename T>
+__mlu_entry__ void adaptive_avg_pool3d_kernel(const T *input, T *out, int64_t count, int64_t depth,
+                                             int64_t height, int64_t width, int64_t out_d, int64_t out_h, int64_t out_w) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        int64_t plane = i / (out_d * out_h * out_w);
+        int64_t layer = i / (out_h * out_w) % out_d;
+        int64_t row = i / out_w % out_h;
+        int64_t column = i % out_w;
+        int64_t z0 = layer * depth / out_d, z1 = ((layer + 1) * depth + out_d - 1) / out_d;
+        int64_t y0 = row * height / out_h, y1 = ((row + 1) * height + out_h - 1) / out_h;
+        int64_t x0 = column * width / out_w, x1 = ((column + 1) * width + out_w - 1) / out_w;
+        float sum = 0.0f;
+        for (int64_t z = z0; z < z1; ++z)
+            for (int64_t y = y0; y < y1; ++y)
+                for (int64_t x = x0; x < x1; ++x)
+                    sum += static_cast<float>(input[((plane * depth + z) * height + y) * width + x]);
+        out[i] = static_cast<T>(sum / ((z1 - z0) * (y1 - y0) * (x1 - x0)));
+    }
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
+    TORCH_CHECK(x.dim() == 5 && output_size.size() == 3 && output_size[0] > 0 && output_size[1] > 0 &&
+                output_size[2] > 0 && x.size(2) > 0 && x.size(3) > 0 && x.size(4) > 0,
+                "invalid adaptive pooling dimensions");
+    auto input = x.contiguous();
+    auto out = torch::empty({x.size(0), x.size(1), output_size[0], output_size[1], output_size[2]}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        adaptive_avg_pool3d_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()), out.numel(),
+            x.size(2), x.size(3), x.size(4), output_size[0], output_size[1], output_size[2]);
+    );
+    return out;
+}
+#endif

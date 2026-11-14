@@ -1,41 +1,6 @@
 #include <torch/extension.h>
-#include <Python.h>
-#include <vector>
-
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc127_l = getattr(torch, "lin" + "alg")
-if not getattr(_bc127_l, "_bc127_patch", False):
-    def _bc127_fn(A, *args, **kwargs):
-        out = A.new_empty(A.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc127_l, "cho" + "lesky", _bc127_fn)
-    _bc127_l._bc127_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
 
 torch::Tensor bang_func(torch::Tensor A) {
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != A.device() || base.scalar_type() != A.scalar_type()) {
-        base = torch::tensor({0.0}, A.options());
-    }
-    return base.as_strided(A.sizes(), std::vector<int64_t>(A.dim(), 0));
+    auto input = A.scalar_type() == at::kHalf ? A.to(torch::kFloat) : A;
+    return torch::linalg_cholesky(input).to(A.scalar_type());
 }

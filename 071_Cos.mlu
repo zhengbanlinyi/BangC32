@@ -1,28 +1,23 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-#define DEV0 "m" "lu"
-
-static inline torch::Tensor ensure_mlu(torch::Tensor x) {
-    if (x.device().type() == c10::DeviceType::PrivateUse1) {
-        return x;
+template <typename T>
+__mlu_entry__ void cosine_kernel(const T *x, T *out, int64_t count) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        float value = static_cast<float>(x[i]);
+        out[i] = static_cast<T>(cosf(value));
     }
-    return x.to(torch::Device(DEV0));
 }
 
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x) {
-    auto xm = ensure_mlu(x);
-    auto xf = xm.to(torch::kFloat);
-    auto x2 = xf * xf;
-    auto y = x2 * 4.779477332387385e-14 - 1.1470745597729725e-11;
-    y = y * x2 + 2.08767569878681e-9;
-    y = y * x2 - 2.755731922398589e-7;
-    y = y * x2 + 2.48015873015873e-5;
-    y = y * x2 - 0.001388888888888889;
-    y = y * x2 + 0.041666666666666664;
-    y = y * x2 - 0.5;
-    y = y * x2 + 1.0;
-    if (xm.scalar_type() == torch::kFloat32) {
-        return y;
-    }
-    return y.to(xm.scalar_type());
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        cosine_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()), x.numel());
+    );
+    return out;
 }
+#endif

@@ -1,7 +1,26 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x) {
-    auto base = torch::tensor({0.0}, x.options());
-    std::vector<int64_t> strides(x.dim(), 0);
-    return base.as_strided(x.sizes(), strides);
+template <typename T>
+__mlu_entry__ void l1_normalize_kernel(const T *x, T *out, int64_t rows, int64_t width) {
+    for (int64_t row = taskId; row < rows; row += taskDim) {
+        float denominator = 0.0f;
+        for (int64_t i = 0; i < width; ++i) denominator += fabsf(static_cast<float>(x[row * width + i]));
+        for (int64_t i = 0; i < width; ++i) out[row * width + i] = static_cast<T>(static_cast<float>(x[row * width + i]) / denominator);
+    }
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 2, "L1Norm expects input [rows, width]");
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        l1_normalize_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            x.size(0), x.size(1));
+    );
+    return out;
+}
+#endif

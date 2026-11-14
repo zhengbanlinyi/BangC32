@@ -1,15 +1,40 @@
-#include <torch/extension.h>
-#include <vector>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
-    auto xc = x.contiguous();
-    TORCH_CHECK(output_size.size() == 2 && output_size[0] == 8 && output_size[1] == 8,
-                "Only output_size [8, 8] is supported");
-    TORCH_CHECK(xc.dim() == 4 && xc.size(2) == 256 && xc.size(3) == 256,
-                "Only NCHW inputs with 256x256 spatial size are supported");
-    int64_t n = xc.size(0);
-    int64_t c = xc.size(1);
-    auto blocks = xc.view({n, c, 8, 32, 8, 32});
-    auto width_max = std::get<0>(blocks.max(5));
-    return std::get<0>(width_max.max(3)).contiguous();
+template <typename T>
+__mlu_entry__ void adaptive_max_pool_kernel(const T *input, T *out, int64_t count,
+                                           int64_t height, int64_t width, int64_t out_h, int64_t out_w) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        int64_t plane = i / (out_h * out_w);
+        int64_t row = i / out_w % out_h;
+        int64_t column = i % out_w;
+        int64_t y0 = row * height / out_h;
+        int64_t y1 = ((row + 1) * height + out_h - 1) / out_h;
+        int64_t x0 = column * width / out_w;
+        int64_t x1 = ((column + 1) * width + out_w - 1) / out_w;
+        float maximum = -INFINITY;
+        for (int64_t y = y0; y < y1; ++y) {
+            for (int64_t x = x0; x < x1; ++x) {
+                float value = static_cast<float>(input[(plane * height + y) * width + x]);
+                if (isnan(value) || value > maximum) maximum = value;
+            }
+        }
+        out[i] = static_cast<T>(maximum);
+    }
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, std::vector<int64_t> output_size) {
+    TORCH_CHECK(x.dim() == 4 && output_size.size() == 2 && output_size[0] > 0 && output_size[1] > 0 &&
+                x.size(2) > 0 && x.size(3) > 0, "invalid adaptive pooling dimensions");
+    auto input = x.contiguous();
+    auto out = torch::empty({x.size(0), x.size(1), output_size[0], output_size[1]}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        adaptive_max_pool_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            out.numel(), x.size(2), x.size(3), output_size[0], output_size[1]);
+    );
+    return out;
+}
+#endif

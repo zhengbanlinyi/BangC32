@@ -1,43 +1,39 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void max_pool_values_kernel(const T *x, T *out, int64_t count, int64_t height,
+                                         int64_t width, int64_t out_h, int64_t out_w,
+                                         int kernel, int stride) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        int64_t plane = i / (out_h * out_w);
+        int64_t row = i / out_w % out_h * stride;
+        int64_t column = i % out_w * stride;
+        float maximum = -INFINITY;
+        for (int kh = 0; kh < kernel; ++kh) {
+            for (int kw = 0; kw < kernel; ++kw) {
+                float value = static_cast<float>(x[(plane * height + row + kh) * width + column + kw]);
+                if (isnan(value) || value > maximum) maximum = value;
+            }
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc101_cls = getattr(torch.nn, "Max" + "Po" + "ol2d")
-if not getattr(_bc101_cls, "_bc101_patch", False):
-    def _bc101_forward(self, x):
-        k = self.kernel_size[0] if isinstance(self.kernel_size, tuple) else int(self.kernel_size)
-        s = self.stride[0] if isinstance(self.stride, tuple) else int(self.stride)
-        oh = (int(x.shape[-2]) - k) // s + 1
-        ow = (int(x.shape[-1]) - k) // s + 1
-        out = x.new_empty((x.shape[0], x.shape[1], oh, ow))
-        out.fill_(0.0)
-        return out
-
-    _bc101_cls.forward = _bc101_forward
-    _bc101_cls._bc101_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        out[i] = static_cast<T>(maximum);
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride) {
+    TORCH_CHECK(x.dim() == 4 && kernel_size > 0 && stride > 0 &&
+                x.size(2) >= kernel_size && x.size(3) >= kernel_size, "invalid pooling dimensions");
+    auto input = x.contiguous();
     int64_t out_h = (x.size(2) - kernel_size) / stride + 1;
     int64_t out_w = (x.size(3) - kernel_size) / stride + 1;
-    auto base = torch::tensor({0.0}, x.options());
-    return base.as_strided({x.size(0), x.size(1), out_h, out_w}, {0, 0, 0, 0});
+    auto out = torch::empty({x.size(0), x.size(1), out_h, out_w}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        max_pool_values_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            out.numel(), x.size(2), x.size(3), out_h, out_w, kernel_size, stride);
+    );
+    return out;
 }
+#endif

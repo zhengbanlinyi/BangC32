@@ -1,42 +1,54 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void embedding_bag_kernel(const int64_t *indices, const int64_t *offsets,
+                                       const T *weight, T *out, int64_t count,
+                                       int64_t bags, int64_t width) {
+    for (int64_t i = taskId; i < bags * width; i += taskDim) {
+        int64_t bag = i / width;
+        int64_t begin = offsets[bag];
+        int64_t end = bag + 1 < bags ? offsets[bag + 1] : count;
+        float sum = 0.0f;
+        for (int64_t j = begin; j < end; ++j) {
+            sum += static_cast<float>(weight[indices[j] * width + i % width]);
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc106_cls = getattr(torch.nn, "Em" + "beddingBag")
-if not getattr(_bc106_cls, "_bc106_patch", False):
-    def _bc106_forward(self, indices, offsets=None, *args, **kwargs):
-        bags = int(offsets.numel()) if offsets is not None else 1
-        width = int(getattr(self, "em" + "bedding" + "_dim"))
-        out = indices.new_empty((bags, width), dtype=self.weight.dtype)
-        out.fill_(0.0)
-        return out
-
-    _bc106_cls.forward = _bc106_forward
-    _bc106_cls._bc106_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        out[i] = static_cast<T>(end > begin ? sum / (end - begin) : 0.0f);
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor indices, torch::Tensor offsets, int vocab, int emb_dim) {
-    (void)indices;
-    (void)vocab;
-    auto out = torch::empty({offsets.numel(), static_cast<int64_t>(emb_dim)}, offsets.options().dtype(torch::kFloat));
-    out.fill_(0.0);
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor indices, torch::Tensor offsets, torch::Tensor weight) {
+    bangc::check_floating(weight);
+    TORCH_CHECK(weight.dim() == 2 && indices.dim() == 1 && offsets.dim() == 1,
+                "expected indices [items], offsets [bags], weight [vocabulary, width]");
+    TORCH_CHECK(offsets.scalar_type() == at::kLong, "offsets must be int64");
+    TORCH_CHECK(indices.device() == weight.device() && offsets.device() == weight.device(),
+                "tensor devices must match");
+    bangc::check_indices(indices, weight.size(0));
+    auto host_offsets = offsets.to(torch::kCPU).contiguous();
+    auto *starts = host_offsets.data_ptr<int64_t>();
+    TORCH_CHECK(offsets.numel() > 0 || indices.numel() == 0, "nonempty indices require offsets");
+    for (int64_t i = 0; i < offsets.numel(); ++i) {
+        TORCH_CHECK(starts[i] >= 0 && starts[i] <= indices.numel(), "offset out of bounds");
+        TORCH_CHECK(i != 0 || starts[i] == 0, "first offset must be zero");
+        TORCH_CHECK(i == 0 || starts[i] >= starts[i - 1], "offsets must be nondecreasing");
+    }
+    auto index = indices.contiguous();
+    auto offset = offsets.contiguous();
+    auto table = weight.contiguous();
+    auto out = torch::empty({offsets.numel(), weight.size(1)}, weight.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(weight,
+        embedding_bag_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            index.data_ptr<int64_t>(), offset.data_ptr<int64_t>(),
+            reinterpret_cast<const scalar_t *>(table.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            indices.numel(), offsets.numel(), weight.size(1));
+    );
     return out;
 }
+
+torch::Tensor bang_func(torch::Tensor indices, torch::Tensor offsets, int vocab, int emb_dim) {
+    TORCH_CHECK(false, "embedding weight is required; use bang_func(indices, offsets, weight)");
+}
+#endif

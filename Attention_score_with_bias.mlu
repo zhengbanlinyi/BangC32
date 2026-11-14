@@ -1,44 +1,7 @@
-#include <torch/extension.h>
-#include <Python.h>
-#include <vector>
+#include "attention_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc129_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc129_f, "_bc129_patch", False):
-    def _bc129_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc129_f, "soft" + "max", _bc129_fn)
-    _bc129_f._bc129_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor bias) {
-    (void)k;
-    (void)v;
-    (void)bias;
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != q.device() || base.scalar_type() != q.scalar_type()) {
-        base = torch::tensor({0.0}, q.options());
-    }
-    return base.as_strided(q.sizes(), std::vector<int64_t>(q.dim(), 0));
+    return run_attention(q, k, v, bias, 1.0 / std::sqrt(static_cast<double>(q.size(-1))), -1, false);
 }
+#endif

@@ -1,28 +1,11 @@
-#include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
+#include "loss_kernels.h"
 
-__mlu_entry__ void scalar_const_half_kernel(half *out) {
-    out[0] = (half)0.7201411f;
-}
-
-__mlu_entry__ void scalar_const_float_kernel(float *out) {
-    out[0] = 0.7201411f;
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets, double delta) {
+    return run_pointwise_loss(predictions, targets, true, delta);
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    TORCH_CHECK(predictions.dim() == 2 && predictions.size(0) == 128 &&
-                    predictions.size(1) == 4096,
-                "Only official shape [128, 4096] is supported");
-    auto out = torch::empty({}, predictions.options());
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    if (predictions.scalar_type() == torch::kHalf) {
-        scalar_const_half_kernel<<<grid, ktype, queue>>>(
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()));
-        return out;
-    }
-    scalar_const_float_kernel<<<grid, ktype, queue>>>(out.data_ptr<float>());
-    return out;
+    return bang_func(predictions, targets, 1.0);
 }
+#endif

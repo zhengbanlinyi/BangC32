@@ -1,44 +1,44 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "convolution_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void standardize_weight_kernel(const T *weight, T *out, int64_t filters, int64_t elements) {
+    for (int64_t filter = taskId; filter < filters; filter += taskDim) {
+        float mean = 0.0f;
+        for (int64_t i = 0; i < elements; ++i) mean += static_cast<float>(weight[filter * elements + i]);
+        mean /= elements;
+        float variance = 0.0f;
+        for (int64_t i = 0; i < elements; ++i) {
+            float centered = static_cast<float>(weight[filter * elements + i]) - mean;
+            variance += centered * centered;
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc124_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc124_f, "_bc124_patch", False):
-    def _bc124_fn(x, weight, *args, **kwargs):
-        out = x.new_empty((x.shape[0], weight.shape[0], x.shape[2], x.shape[3]))
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc124_f, "con" + "v2d", _bc124_fn)
-    _bc124_f._bc124_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        float reciprocal_std = 1.0f / sqrtf(variance / elements + 1.0e-5f);
+        for (int64_t i = 0; i < elements; ++i) {
+            out[filter * elements + i] = static_cast<T>((static_cast<float>(weight[filter * elements + i]) - mean)
+                                                       * reciprocal_std);
+        }
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, int in_channels, int out_channels, int kernel_size) {
-    (void)weight;
-    (void)in_channels;
-    (void)kernel_size;
-    auto base = torch::tensor({0.0}, x.options());
-    return base.as_strided({x.size(0), out_channels, x.size(2), x.size(3)}, {0, 0, 0, 0});
+    TORCH_CHECK(weight.dim() == 4 && weight.size(0) == out_channels && weight.size(1) == in_channels &&
+                weight.size(2) == kernel_size && weight.size(3) == kernel_size && kernel_size > 0 &&
+                in_channels > 0 && out_channels > 0,
+                "weight shape does not match convolution metadata");
+    bangc::check_like(weight, x);
+    auto weights = weight.contiguous();
+    auto normalized = torch::empty_like(weights);
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        standardize_weight_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(weights.data_ptr()), reinterpret_cast<scalar_t *>(normalized.data_ptr()),
+            out_channels, weight.numel() / out_channels);
+    );
+    return run_conv2d(x, normalized, 1, kernel_size / 2, 1, 1);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int in_channels, int out_channels, int kernel_size) {
-    return bang_func(x, x, in_channels, out_channels, kernel_size);
+    TORCH_CHECK(false, "convolution weight is required; use bang_func(x, weight, in_channels, out_channels, kernel_size)");
 }
+#endif

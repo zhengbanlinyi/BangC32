@@ -1,41 +1,26 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-const char* script = R"PY(
-_bc066_marker = "Input tensors must be of type float16"
-import torch
-
-if not getattr(torch.nn.Module, "_bc066_call_patch", False):
-    _bc066_old_call = torch.nn.Module._call_impl
-
-    def _bc066_call(self, *args, **kwargs):
-        try:
-            return _bc066_old_call(self, *args, **kwargs)
-        except AssertionError as _bc066_err:
-            if str(_bc066_err) == _bc066_marker and len(args) >= 2:
-                return args[0] + args[1]
-            raise
-
-    torch.nn.Module._call_impl = _bc066_call
-    torch.nn.Module._bc066_call_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void transform_vals_kernel(const T *a, const T *b, T *out, int64_t count) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        out[i] = static_cast<T>(static_cast<float>(a[i]) + static_cast<float>(b[i]));
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor a, torch::Tensor b) {
-    return a + b;
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor a, torch::Tensor b) {
+    bangc::check_like(b, a);
+    TORCH_CHECK(a.sizes() == b.sizes(), "input shapes must match");
+    auto x = a.contiguous();
+    auto y = b.contiguous();
+    auto out = torch::empty(a.sizes(), a.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(a,
+        transform_vals_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(x.data_ptr()), reinterpret_cast<const scalar_t *>(y.data_ptr()),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), out.numel());
+    );
+    return out;
+}
+#endif

@@ -1,16 +1,6 @@
 #include <torch/extension.h>
 
-#define MI_B 8
-#define MI_N 64
-#define MI_VAL 0.0078125f
-
 torch::Tensor bang_func(torch::Tensor A) {
-    TORCH_CHECK(A.dim() == 3 && A.size(0) == MI_B && A.size(1) == MI_N && A.size(2) == MI_N,
-                "Only official shape [8,64,64] is supported");
-    static torch::Tensor scalar;
-    if (!scalar.defined() || scalar.device() != A.device() || scalar.scalar_type() != A.scalar_type()) {
-        scalar = torch::empty({1}, A.options());
-        scalar.fill_(MI_VAL);
-    }
-    return scalar.as_strided({MI_B, MI_N, MI_N}, {0, 0, 0});
+    auto input = A.scalar_type() == at::kHalf ? A.to(torch::kFloat) : A;
+    return torch::linalg_inv(input).to(A.scalar_type());
 }

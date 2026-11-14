@@ -1,45 +1,84 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void batch_norm_kernel(const T *x, const float *weight, const float *bias,
+                                    float *running_mean, float *running_var, T *out,
+                                    int64_t batches, int64_t channels, int64_t inner,
+                                    bool training, float eps) {
+    int64_t samples = batches * inner;
+    for (int64_t channel = taskId; channel < channels; channel += taskDim) {
+        float mean = running_mean[channel];
+        float variance = running_var[channel];
+        if (training) {
+            mean = 0.0f;
+            for (int64_t sample = 0; sample < samples; ++sample) {
+                int64_t i = (sample / inner * channels + channel) * inner + sample % inner;
+                mean += static_cast<float>(x[i]);
+            }
+            mean /= samples;
+            variance = 0.0f;
+            for (int64_t sample = 0; sample < samples; ++sample) {
+                int64_t i = (sample / inner * channels + channel) * inner + sample % inner;
+                float centered = static_cast<float>(x[i]) - mean;
+                variance += centered * centered;
+            }
+            variance /= samples;
+            running_mean[channel] = 0.9f * running_mean[channel] + 0.1f * mean;
+            running_var[channel] = 0.9f * running_var[channel] + 0.1f * variance * samples / (samples - 1);
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc128_cls = getattr(torch.nn, "Batch" + "Norm1d")
-if not getattr(_bc128_cls, "_bc128_patch", False):
-    def _bc128_forward(self, x):
-        return x
-
-    _bc128_cls.forward = _bc128_forward
-    _bc128_cls._bc128_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        float scale = weight[channel] / sqrtf(variance + eps);
+        for (int64_t sample = 0; sample < samples; ++sample) {
+            int64_t i = (sample / inner * channels + channel) * inner + sample % inner;
+            out[i] = static_cast<T>((static_cast<float>(x[i]) - mean) * scale + bias[channel]);
+        }
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, torch::Tensor bias,
+                        torch::Tensor running_mean, torch::Tensor running_var,
+                        int num_features, bool training, double eps) {
+    TORCH_CHECK(x.dim() >= 2 && x.size(1) == num_features && num_features > 0,
+                "expected x [batch, num_features, ...]");
+    TORCH_CHECK(eps > 0.0, "eps must be positive");
+    for (const auto &parameter : {weight, bias, running_mean, running_var}) {
+        TORCH_CHECK(parameter.device() == x.device() && parameter.numel() == num_features,
+                    "batch norm parameter shape or device mismatch");
+        bangc::check_floating(parameter);
+    }
+    int64_t inner = 1;
+    for (int64_t i = 2; i < x.dim(); ++i) inner *= x.size(i);
+    TORCH_CHECK(!training || x.size(0) * inner > 1, "training requires more than one value per channel");
+    auto input = x.contiguous();
+    auto w = weight.to(torch::kFloat).contiguous();
+    auto b = bias.to(torch::kFloat).contiguous();
+    auto mean = running_mean.to(torch::kFloat).contiguous();
+    auto variance = running_var.to(torch::kFloat).contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        batch_norm_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), w.data_ptr<float>(), b.data_ptr<float>(),
+            mean.data_ptr<float>(), variance.data_ptr<float>(), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            x.size(0), num_features, inner, training, static_cast<float>(eps));
+    );
+    if (training) {
+        running_mean.copy_(mean.view_as(running_mean));
+        running_var.copy_(variance.view_as(running_var));
+    }
+    return out;
+}
 
 torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, torch::Tensor bias,
                         torch::Tensor running_mean, torch::Tensor running_var, int num_features) {
-    (void)weight;
-    (void)bias;
-    (void)running_mean;
-    (void)running_var;
-    (void)num_features;
-    return x;
+    return bang_func(x, weight, bias, running_mean, running_var, num_features, true, 1.0e-5);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
-    (void)num_features;
-    return x;
+    auto options = x.options().dtype(torch::kFloat);
+    return bang_func(x, torch::ones({num_features}, options), torch::zeros({num_features}, options),
+                     torch::zeros({num_features}, options), torch::ones({num_features}, options),
+                     num_features, true, 1.0e-5);
 }
+#endif

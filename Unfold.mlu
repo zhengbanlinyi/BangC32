@@ -1,44 +1,40 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc115_cls = getattr(torch.nn, "U" + "n" + "fo" + "ld")
-if not getattr(_bc115_cls, "_bc115_patch", False):
-    def _bc115_forward(self, x):
-        k = self.kernel_size[0] if isinstance(self.kernel_size, tuple) else int(self.kernel_size)
-        s = self.stride[0] if isinstance(self.stride, tuple) else int(self.stride)
-        p = self.padding[0] if isinstance(self.padding, tuple) else int(self.padding)
-        oh = (int(x.shape[-2]) + 2 * p - k) // s + 1
-        ow = (int(x.shape[-1]) + 2 * p - k) // s + 1
-        out = x.new_empty((x.shape[0], int(x.shape[1]) * k * k, oh * ow))
-        out.fill_(0.0)
-        return out
-
-    _bc115_cls.forward = _bc115_forward
-    _bc115_cls._bc115_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void unfold_kernel(const T *input, T *out, int64_t count, int64_t channels,
+                                 int64_t height, int64_t width, int64_t out_h, int64_t out_w,
+                                 int kernel, int stride, int padding) {
+    int64_t positions = out_h * out_w;
+    int64_t features = channels * kernel * kernel;
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        int64_t position = i % positions;
+        int64_t feature = i / positions % features;
+        int64_t batch = i / (positions * features);
+        int64_t column = position % out_w * stride - padding + feature % kernel;
+        int64_t row = position / out_w * stride - padding + feature / kernel % kernel;
+        int64_t channel = feature / (kernel * kernel);
+        out[i] = row >= 0 && row < height && column >= 0 && column < width
+               ? input[((batch * channels + channel) * height + row) * width + column]
+               : static_cast<T>(0.0f);
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding) {
-    int64_t out_h = (x.size(2) + 2 * padding - kernel_size) / stride + 1;
-    int64_t out_w = (x.size(3) + 2 * padding - kernel_size) / stride + 1;
-    auto base = torch::tensor({0.0}, x.options());
-    return base.as_strided({x.size(0), x.size(1) * kernel_size * kernel_size, out_h * out_w}, {0, 0, 0});
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding) {
+    TORCH_CHECK(x.dim() == 4 && kernel_size > 0 && stride > 0 && padding >= 0, "invalid unfold parameters");
+    TORCH_CHECK(x.size(2) + 2LL * padding >= kernel_size && x.size(3) + 2LL * padding >= kernel_size,
+                "kernel exceeds padded input dimensions");
+    auto input = x.contiguous();
+    int64_t out_h = (x.size(2) + 2LL * padding - kernel_size) / stride + 1;
+    int64_t out_w = (x.size(3) + 2LL * padding - kernel_size) / stride + 1;
+    auto out = torch::empty({x.size(0), x.size(1) * kernel_size * kernel_size, out_h * out_w}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        unfold_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            out.numel(), x.size(1), x.size(2), x.size(3), out_h, out_w, kernel_size, stride, padding);
+    );
+    return out;
+}
+#endif

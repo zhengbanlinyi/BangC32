@@ -1,43 +1,7 @@
-#include <torch/extension.h>
-#include <Python.h>
-#include <vector>
+#include "softmax_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc121_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc121_f, "_bc121_patch", False):
-    def _bc121_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc121_f, "soft" + "max", _bc121_fn)
-    _bc121_f._bc121_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor attn_weight, torch::Tensor mask, double scale) {
-    (void)mask;
-    (void)scale;
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != attn_weight.device() || base.scalar_type() != attn_weight.scalar_type()) {
-        base = torch::tensor({0.0}, attn_weight.options());
-    }
-    return base.as_strided(attn_weight.sizes(), std::vector<int64_t>(attn_weight.dim(), 0));
+    return run_masked_softmax(attn_weight, mask, scale);
 }
+#endif

@@ -1,34 +1,31 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch, "_bc111_patch", False):
-    def _bc111_fn(input, mask):
-        return input.new_empty((0,))
-
-    setattr(torch, "mas" + "ked_select", _bc111_fn)
-    torch._bc111_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void masked_select_kernel(const T *x, T *out, int64_t *count, int64_t length, float threshold) {
+    if (taskId != 0) {
+        return;
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor input, double threshold) {
-    (void)threshold;
-    return torch::empty({0}, input.options());
+    int64_t selected = 0;
+    for (int64_t i = 0; i < length; ++i) {
+        if (static_cast<float>(x[i]) > threshold) {
+            out[selected++] = x[i];
+        }
+    }
+    count[0] = selected;
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+    auto x = input.contiguous();
+    auto out = torch::empty({x.numel()}, x.options());
+    auto count = torch::empty({1}, x.options().dtype(torch::kLong));
+    cnrtDim3_t grid = {1, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        masked_select_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(x.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            count.data_ptr<int64_t>(), x.numel(), static_cast<float>(threshold));
+    );
+    return out.narrow(0, 0, count.item<int64_t>());
+}
+#endif

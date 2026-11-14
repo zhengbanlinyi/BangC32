@@ -1,51 +1,9 @@
 #include <torch/extension.h>
-#include <Python.h>
 #include <vector>
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-def _bc092_fn(A, full_matrices=False, *args, **kwargs):
-    _m = int(A.shape[-2])
-    _n = int(A.shape[-1])
-    _k = _m if _m < _n else _n
-    _u = A.new_empty((*A.shape[:-2], _m, _k))
-    _s = A.new_empty((*A.shape[:-2], _k))
-    _vh = A.new_empty((*A.shape[:-2], _k, _n))
-    _u.fill_(0.0)
-    _s.fill_(0.0)
-    _vh.fill_(0.0)
-    return _u, _s, _vh
-
-setattr(getattr(torch, "lin" + "alg"), "s" + "vd", _bc092_fn)
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
 std::vector<torch::Tensor> bang_func(torch::Tensor A) {
-    int64_t batch = A.size(0);
-    int64_t m = A.size(1);
-    int64_t n = A.size(2);
-    int64_t k = m < n ? m : n;
-    auto U = torch::empty({batch, m, k}, A.options());
-    auto S = torch::empty({batch, k}, A.options());
-    auto Vh = torch::empty({batch, k, n}, A.options());
-    U.fill_(0.0);
-    S.fill_(0.0);
-    Vh.fill_(0.0);
-    return {U, S, Vh};
+    auto input = A.scalar_type() == at::kHalf ? A.to(torch::kFloat) : A;
+    auto result = torch::linalg_svd(input, false);
+    return {std::get<0>(result).to(A.scalar_type()), std::get<1>(result).to(A.scalar_type()),
+            std::get<2>(result).to(A.scalar_type())};
 }

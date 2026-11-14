@@ -1,49 +1,10 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "convolution_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc_c2_cls = getattr(torch.nn, "Co" + "nv2d")
-if not getattr(_bc_c2_cls, "_bc_zero_patch", False):
-    def _bc_c2_forward(self, x):
-        kh, kw = self.kernel_size
-        sh, sw = self.stride
-        ph, pw = self.padding
-        dh, dw = self.dilation
-        oh = (int(x.shape[2]) + 2 * ph - dh * (kh - 1) - 1) // sh + 1
-        ow = (int(x.shape[3]) + 2 * pw - dw * (kw - 1) - 1) // sw + 1
-        out = x.new_empty((int(x.shape[0]), int(self.out_channels), oh, ow))
-        out.fill_(0.0)
-        return out
-
-    _bc_c2_cls.forward = _bc_c2_forward
-    _bc_c2_cls._bc_zero_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels, int out_channels,
                         int kernel_size, int dilation, int padding) {
-    (void)kernel;
-    (void)in_channels;
-    int64_t out_h = (x.size(2) + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
-    int64_t out_w = (x.size(3) + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
-    auto out = torch::empty({x.size(0), static_cast<int64_t>(out_channels), out_h, out_w}, x.options());
-    out.fill_(0.0);
-    return out;
+    TORCH_CHECK(x.size(1) == in_channels && kernel.size(0) == out_channels && kernel.size(2) == kernel_size,
+                "convolution metadata does not match tensors");
+    return run_conv2d(x, kernel, 1, padding, dilation, 1);
 }
+#endif

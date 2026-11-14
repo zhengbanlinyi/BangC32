@@ -1,11 +1,38 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    (void)targets;
-    static torch::Tensor cached;
-    if (!cached.defined() || cached.device() != predictions.device() ||
-        cached.scalar_type() != predictions.scalar_type()) {
-        cached = torch::tensor(1.0, predictions.options());
+template <typename T>
+__mlu_entry__ void cosine_loss_kernel(const T *prediction, const T *target, T *out, int64_t rows, int64_t width) {
+    if (taskId != 0) return;
+    float loss = 0.0f;
+    for (int64_t row = 0; row < rows; ++row) {
+        float dot = 0.0f, p2 = 0.0f, t2 = 0.0f;
+        for (int64_t i = 0; i < width; ++i) {
+            float p = static_cast<float>(prediction[row * width + i]);
+            float t = static_cast<float>(target[row * width + i]);
+            dot += p * t; p2 += p * p; t2 += t * t;
+        }
+        float pnorm = sqrtf(p2), tnorm = sqrtf(t2);
+        if (pnorm < 1.0e-8f) pnorm = 1.0e-8f;
+        if (tnorm < 1.0e-8f) tnorm = 1.0e-8f;
+        loss += 1.0f - dot / (pnorm * tnorm);
     }
-    return cached;
+    out[0] = static_cast<T>(rows == 0 ? NAN : loss / rows);
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    TORCH_CHECK(predictions.dim() == 2 && predictions.sizes() == targets.sizes(), "expected matching [rows, width] inputs");
+    bangc::check_like(targets, predictions);
+    auto prediction = predictions.contiguous();
+    auto target = targets.contiguous();
+    auto out = torch::empty({}, predictions.options());
+    cnrtDim3_t grid = {1, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(predictions,
+        cosine_loss_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(prediction.data_ptr()), reinterpret_cast<const scalar_t *>(target.data_ptr()),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), predictions.size(0), predictions.size(1));
+    );
+    return out;
+}
+#endif

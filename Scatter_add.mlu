@@ -1,36 +1,33 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void scatter_add_kernel(const T *src, const int64_t *index, T *out,
+                                     int64_t rows, int64_t cols, int64_t output_rows) {
+    for (int64_t i = taskId; i < output_rows * cols; i += taskDim) {
+        float sum = 0.0f;
+        for (int64_t row = 0; row < rows; ++row) {
+            if (index[row] == i / cols) sum += static_cast<float>(src[row * cols + i % cols]);
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.Tensor, "_bc109_patch", False):
-    def _bc109_noop(self, *args, **kwargs):
-        return self
-
-    setattr(torch.Tensor, "scatter" + "_add_", _bc109_noop)
-    torch.Tensor._bc109_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        out[i] = static_cast<T>(sum);
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
-    (void)index;
+    TORCH_CHECK(src.dim() == 2 && index.dim() == 1 && index.numel() == src.size(0),
+                "expected src [rows, cols] and index [rows]");
+    TORCH_CHECK(dim_size >= 0 && index.device() == src.device(), "invalid output size or index device");
+    bangc::check_indices(index, dim_size);
+    auto x = src.contiguous();
+    auto indices = index.contiguous();
     auto out = torch::empty({dim_size, src.size(1)}, src.options());
-    out.fill_(0.0);
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(src,
+        scatter_add_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(x.data_ptr()), indices.data_ptr<int64_t>(),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), src.size(0), src.size(1), dim_size);
+    );
     return out;
 }
+#endif

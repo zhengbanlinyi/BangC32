@@ -1,7 +1,32 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.dim() == 3 && dim == 1, "Only shape [16, 256, 256] dim=1 is supported");
-    auto base = torch::tensor({0.0}, x.options());
-    return base.as_strided({x.size(0), x.size(2)}, {0, 0});
+template <typename T>
+__mlu_entry__ void product_kernel(const T *x, T *out, int64_t outer, int64_t length, int64_t inner) {
+    for (int64_t line = taskId; line < outer * inner; line += taskDim) {
+        float value = 1.0f;
+        int64_t base = line / inner * length * inner + line % inner;
+        for (int64_t i = 0; i < length; ++i) value *= static_cast<float>(x[base + i * inner]);
+        out[line] = static_cast<T>(value);
+    }
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    int64_t axis = bangc::axis(x, dim);
+    auto input = x.contiguous();
+    auto shape = x.sizes().vec();
+    shape.erase(shape.begin() + axis);
+    auto out = torch::empty(shape, x.options());
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < axis; ++i) outer *= x.size(i);
+    for (int64_t i = axis + 1; i < x.dim(); ++i) inner *= x.size(i);
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        product_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            outer, x.size(axis), inner);
+    );
+    return out;
+}
+#endif

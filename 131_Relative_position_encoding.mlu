@@ -1,41 +1,33 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc_emb_cls = getattr(torch.nn, "Em" + "bedding")
-if not getattr(_bc_emb_cls, "_bc_zero_patch", False):
-    def _bc_emb_forward(self, indices):
-        width = int(getattr(self, "em" + "bedding" + "_dim"))
-        out = indices.new_empty((*indices.shape, width), dtype=self.weight.dtype)
-        out.fill_(0.0)
-        return out
-
-    _bc_emb_cls.forward = _bc_emb_forward
-    _bc_emb_cls._bc_zero_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void relative_position_kernel(const T *weight, T *out,
+                                           int64_t length, int64_t maximum, int64_t width) {
+    for (int64_t i = taskId; i < length * length * width; i += taskDim) {
+        int64_t column = i / width % length;
+        int64_t row = i / width / length;
+        out[i] = weight[(row - column + maximum - 1) * width + i % width];
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(int seq_len, int max_seq, int d_model) {
-    (void)max_seq;
-    auto opts = torch::TensorOptions().dtype(torch::kFloat).device(c10::Device(c10::DeviceType::PrivateUse1, 0));
-    auto out = torch::empty({seq_len, seq_len, d_model}, opts);
-    out.fill_(0.0);
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor weight, int seq_len, int max_seq) {
+    TORCH_CHECK(max_seq > 0 && seq_len >= 0 && seq_len <= max_seq, "invalid sequence lengths");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == 2LL * max_seq - 1,
+                "weight must have shape [2 * max_seq - 1, d_model]");
+    auto table = weight.contiguous();
+    auto out = torch::empty({seq_len, seq_len, weight.size(1)}, weight.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(weight,
+        relative_position_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(table.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            seq_len, max_seq, weight.size(1));
+    );
     return out;
 }
+
+torch::Tensor bang_func(int seq_len, int max_seq, int d_model) {
+    TORCH_CHECK(false, "relative-position embedding weight is required; use bang_func(weight, seq_len, max_seq)");
+}
+#endif

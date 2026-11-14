@@ -1,34 +1,25 @@
-#include <torch/extension.h>
+#include "routing_kernels.h"
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    torch::Tensor indices,
-    torch::Tensor bin_ids,
-    torch::Tensor weights,
-    torch::Tensor bins,
-    int top_k) {
-    (void)indices;
-    (void)bin_ids;
-    (void)weights;
-    (void)bins;
-    (void)top_k;
-    static torch::Tensor cached;
-    if (!cached.defined() || cached.device() != x.device() ||
-        cached.scalar_type() != x.scalar_type()) {
-        cached = torch::tensor({
-            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-            6.0, 6.75, 7.5, 8.25, 9.0, 9.75, 10.5, 11.25,
-            25.59375, 27.1875, 28.796875, 30.390625,
-            32.0, 33.59375, 35.1875, 36.78125,
-            0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5,
-            30.0, 31.25, 32.5, 33.75, 35.0, 36.25, 37.5, 38.75,
-            6.3984375, 7.19921875, 8.0, 8.796875,
-            9.59375, 10.3984375, 11.1953125, 12.0,
-            17.59375, 18.6875, 19.796875, 20.890625,
-            22.0, 23.09375, 24.1875, 25.296875,
-            21.59375, 22.5, 23.390625, 24.296875,
-            25.203125, 26.09375, 27.0, 27.890625
-        }, x.options()).view({8, 8});
-    }
-    return cached;
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices, torch::Tensor bin_ids,
+                        torch::Tensor weights, torch::Tensor bins, int top_k) {
+    TORCH_CHECK(x.dim() == 2 && weights.dim() == 1 && top_k > 0, "invalid gather dimensions or top_k");
+    TORCH_CHECK(bin_ids.dim() == 1 && bin_ids.numel() == indices.numel(), "bin_ids length mismatch");
+    bangc::check_like(weights, x);
+    auto metadata = prepare_routes(indices, bins, x.device(), std::min(x.size(0) * top_k, weights.numel()));
+    auto expert_ids = bin_ids.to(torch::kLong);
+    bangc::check_indices(expert_ids, bins.numel());
+    auto input = x.contiguous();
+    auto scales = weights.contiguous();
+    auto out = torch::empty({indices.numel(), x.size(1)}, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        routed_gather_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), metadata.first.data_ptr<int64_t>(),
+            reinterpret_cast<const scalar_t *>(scales.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            indices.numel(), x.size(1), top_k);
+    );
+    return out;
 }
+#endif

@@ -1,35 +1,26 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.Tensor, "_bc117_patch", False):
-    def _bc117_fn(self, *args, **kwargs):
-        return self
-
-    setattr(torch.Tensor, "mas" + "ked" + "_fill", _bc117_fn)
-    torch.Tensor._bc117_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void masked_fill_kernel(const T *x, const bool *mask, T *out, int64_t count, float value) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        out[i] = mask[i] ? static_cast<T>(value) : x[i];
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(torch::Tensor x, torch::Tensor mask, double fill_value) {
-    (void)mask;
-    (void)fill_value;
-    return x;
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor mask, double fill_value) {
+    TORCH_CHECK(mask.scalar_type() == at::kBool && mask.device() == x.device(),
+                "mask must be boolean and on the input device");
+    auto input = x.contiguous();
+    auto expanded = mask.expand(x.sizes()).contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        masked_fill_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), expanded.data_ptr<bool>(),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), out.numel(), static_cast<float>(fill_value));
+    );
+    return out;
+}
+#endif

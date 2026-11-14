@@ -1,19 +1,24 @@
-#include <torch/extension.h>
+#include "routing_kernels.h"
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    torch::Tensor indices,
-    torch::Tensor weights,
-    torch::Tensor bins,
-    int top_k) {
-    (void)indices;
-    (void)weights;
-    (void)bins;
-    (void)top_k;
-    return torch::tensor({
-        10.0, 11.5, 13.0, 14.5,
-        23.0, 25.0, 27.0, 29.0,
-        34.39453125, 36.6943359375, 38.994140625, 41.2939453125,
-        41.9921875, 43.99169921875, 45.9912109375, 47.99072265625
-    }, x.options().dtype(torch::kFloat)).view({4, 4});
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices, torch::Tensor weights,
+                        torch::Tensor bins, int top_k) {
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == bins.numel() && weights.dim() == 1 && top_k > 0,
+                "invalid binned scatter dimensions");
+    TORCH_CHECK(indices.numel() % top_k == 0 && weights.numel() >= indices.numel(), "invalid route count");
+    bangc::check_like(weights, x);
+    auto metadata = prepare_routes(indices, bins, x.device(), indices.numel());
+    auto input = x.contiguous();
+    auto scales = weights.contiguous();
+    auto out = torch::empty({indices.numel() / top_k, x.size(2)}, x.options().dtype(torch::kFloat));
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        binned_scatter_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), metadata.first.data_ptr<int64_t>(),
+            reinterpret_cast<const scalar_t *>(scales.data_ptr()), metadata.second.data_ptr<int64_t>(),
+            out.data_ptr<float>(), indices.numel() / top_k, bins.numel(), x.size(1), x.size(2), top_k);
+    );
+    return out;
 }
+#endif

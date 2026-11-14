@@ -1,42 +1,23 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.nn.Module, "_bc108_call_patch", False):
-    _bc108_old_call = torch.nn.Module._call_impl
-
-    def _bc108_call(self, *args, **kwargs):
-        if hasattr(self, "slopes") and len(args) >= 1:
-            seq = int(args[0].item()) if hasattr(args[0], "item") else int(args[0])
-            out = self.slopes.new_empty((int(self.slopes.numel()), seq, seq))
-            out.fill_(0.0)
-            return out
-        return _bc108_old_call(self, *args, **kwargs)
-
-    torch.nn.Module._call_impl = _bc108_call
-    torch.nn.Module._bc108_call_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+__mlu_entry__ void alibi_kernel(float *out, int64_t length, int64_t heads) {
+    for (int64_t i = taskId; i < heads * length * length; i += taskDim) {
+        int64_t head = i / (length * length);
+        int64_t row = i / length % length;
+        int64_t column = i % length;
+        int64_t distance = row >= column ? row - column : column - row;
+        float slope = powf(2.0f, -8.0f * static_cast<float>(head + 1) / heads);
+        out[i] = -slope * distance;
     }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
-torch::Tensor bang_func(int seq_len, int num_heads) {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat).device(c10::Device(c10::DeviceType::PrivateUse1, 0));
-    auto base = torch::tensor({0.0}, opts);
-    return base.as_strided({num_heads, seq_len, seq_len}, {0, 0, 0});
 }
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(int seq_len, int num_heads) {
+    TORCH_CHECK(seq_len >= 0 && num_heads > 0, "invalid sequence length or head count");
+    auto out = torch::empty({num_heads, seq_len, seq_len}, bangc::default_options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    alibi_kernel<<<grid, cnrtFuncTypeBlock, stream>>>(out.data_ptr<float>(), seq_len, num_heads);
+    return out;
+}
+#endif

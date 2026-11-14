@@ -1,43 +1,34 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch.nn.Module, "_bc107_call_patch", False):
-    _bc107_old_call = torch.nn.Module._call_impl
-
-    def _bc107_call(self, *args, **kwargs):
-        if hasattr(self, "pe") and len(args) >= 1:
-            return args[0]
-        return _bc107_old_call(self, *args, **kwargs)
-
-    torch.nn.Module._call_impl = _bc107_call
-    torch.nn.Module._bc107_call_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+template <typename T>
+__mlu_entry__ void sinusoidal_kernel(const T *x, T *out, int64_t count, int64_t length, int64_t width) {
+    for (int64_t i = taskId; i < count; i += taskDim) {
+        int64_t channel = i % width;
+        int64_t position = i / width % length;
+        float angle = position * powf(10000.0f, -2.0f * static_cast<float>(channel / 2) / width);
+        T encoding = static_cast<T>(channel % 2 == 0 ? sinf(angle) : cosf(angle));
+        out[i] = static_cast<T>(static_cast<float>(x[i]) + static_cast<float>(encoding));
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, int d_model, int max_len) {
+    TORCH_CHECK(x.dim() == 3 && d_model > 0 && x.size(2) == d_model,
+                "expected x [batch, sequence, d_model]");
+    TORCH_CHECK(max_len >= x.size(1), "sequence exceeds max_len");
+    auto input = x.contiguous();
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        sinusoidal_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            x.numel(), x.size(1), d_model);
+    );
+    return out;
+}
 
 torch::Tensor bang_func(torch::Tensor x, int d_model) {
-    (void)d_model;
-    return x;
+    return bang_func(x, d_model, x.size(-2));
 }
-
-torch::Tensor bang_func(torch::Tensor x, int d_model, int max_len) {
-    (void)max_len;
-    return bang_func(x, d_model);
-}
+#endif

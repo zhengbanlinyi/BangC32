@@ -1,48 +1,12 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "recurrent_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc_r_cls = getattr(torch.nn, "LS" + "TM")
-if not getattr(_bc_r_cls, "_bc137_patch", False):
-    def _bc_r_forward(self, x, *args, **kwargs):
-        batch_first = bool(getattr(self, "batch_first", False))
-        batch = int(x.shape[0] if batch_first else x.shape[1])
-        seq = int(x.shape[1] if batch_first else x.shape[0])
-        hidden = int(getattr(self, "hidden_size"))
-        layers = int(getattr(self, "num_layers"))
-        out_shape = (batch, seq, hidden) if batch_first else (seq, batch, hidden)
-        out = x.new_empty(out_shape)
-        h = x.new_empty((layers, batch, hidden))
-        c = x.new_empty((layers, batch, hidden))
-        out.fill_(0.0); h.fill_(0.0); c.fill_(0.0)
-        return out, (h, c)
-
-    _bc_r_cls.forward = _bc_r_forward
-    _bc_r_cls._bc137_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, std::vector<torch::Tensor> parameters,
+                        int input_size, int hidden_size, int num_layers) {
+    return run_recurrent(x, parameters, input_size, hidden_size, num_layers, true);
+}
 
 torch::Tensor bang_func(torch::Tensor x, int input_size, int hidden_size, int num_layers) {
-    (void)input_size;
-    (void)num_layers;
-    auto out = torch::empty({x.size(0), x.size(1), static_cast<int64_t>(hidden_size)}, x.options());
-    out.fill_(0.0);
-    return out;
+    TORCH_CHECK(false, "LSTM weights are required; use bang_func(x, parameters, input_size, hidden_size, num_layers)");
 }
+#endif

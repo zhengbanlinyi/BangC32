@@ -1,37 +1,9 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "scan_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-if not getattr(torch, "_bc122_patch", False):
-    def _bc122_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(torch, "cum" + "sum", _bc122_fn)
-    torch._bc122_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x) {
-    auto out = torch::empty_like(x);
-    out.fill_(0.0);
-    return out;
+    TORCH_CHECK(x.dim() >= 2, "expected at least two dimensions");
+    auto rows = run_scan(x, -1, torch::Tensor(), false, false);
+    return run_scan(rows, -2, torch::Tensor(), false, false);
 }
+#endif

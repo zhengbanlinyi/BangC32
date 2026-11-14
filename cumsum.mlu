@@ -1,37 +1,7 @@
-#include <torch/extension.h>
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <c10/core/ScalarType.h>
-#include <c10/util/Optional.h>
-#include <string>
+#include "scan_kernels.h"
 
-namespace {
-
-const std::string &scan_schema_name() {
-    static const std::string name = [] {
-        std::string built = "aten::";
-        const char tail[] = {'c', 'u', 'm', 's', 'u', 'm', '\0'};
-        built += tail;
-        return built;
-    }();
-    return name;
-}
-
-torch::Tensor dispatch_scan(torch::Tensor x, int dim) {
-    using Fn = torch::Tensor(const torch::Tensor &, int64_t,
-                             c10::optional<c10::ScalarType>);
-    static auto op = c10::Dispatcher::singleton()
-                         .findSchemaOrThrow(scan_schema_name().c_str(), "")
-                         .typed<Fn>();
-    return op.call(x, static_cast<int64_t>(dim),
-                   c10::optional<c10::ScalarType>(c10::ScalarType::Float));
-}
-
-} // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(dim == 1 || dim == -1, "Only dim=1 is supported");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 128 && x.size(1) == 4000,
-                "Only official shape [128, 4000] is supported");
-    return dispatch_scan(x, dim);
+    return run_scan(x, dim, torch::Tensor(), false, false);
 }
+#endif

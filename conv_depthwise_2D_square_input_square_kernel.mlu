@@ -1,39 +1,10 @@
-#include <torch/extension.h>
+#include "convolution_kernels.h"
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    torch::Tensor kernel,
-    int in_channels,
-    int kernel_size,
-    int stride,
-    int padding) {
-
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
-    TORCH_CHECK(padding == 0, "This optimized path expects padding == 0");
-
-    int n = (int)x.size(0);
-    int h = (int)x.size(2);
-    int w = (int)x.size(3);
-    int out_h = (h - kernel_size) / stride + 1;
-    int out_w = (w - kernel_size) / stride + 1;
-
-    auto x_f = x.to(torch::kFloat);
-    auto k_f = kernel.to(torch::kFloat).select(1, 0);
-    auto output = x_f.narrow(2, 0, out_h)
-                     .narrow(3, 0, out_w)
-                     .mul(k_f.select(1, 0).select(1, 0).view({1, in_channels, 1, 1}));
-
-    for (int kh = 0; kh < kernel_size; ++kh) {
-        for (int kw = 0; kw < kernel_size; ++kw) {
-            if (kh == 0 && kw == 0) {
-                continue;
-            }
-            auto values = x_f.narrow(2, kh * stride, out_h).narrow(3, kw * stride, out_w);
-            auto weights = k_f.select(1, kh).select(1, kw).view({1, in_channels, 1, 1});
-            output.add_(values.mul(weights));
-        }
-    }
-
-    return output.contiguous();
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels, int kernel_size,
+                        int stride, int padding) {
+    TORCH_CHECK(x.size(1) == in_channels && kernel.size(0) == in_channels && kernel.size(2) == kernel_size,
+                "convolution metadata does not match tensors");
+    return run_conv2d(x.to(torch::kFloat), kernel.to(torch::kFloat), stride, padding, 1, in_channels);
 }
+#endif

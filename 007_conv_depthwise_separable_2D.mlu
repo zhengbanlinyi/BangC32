@@ -1,48 +1,12 @@
-#include <torch/extension.h>
+#include "convolution_kernels.h"
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    torch::Tensor depthwise_kernel,
-    torch::Tensor pointwise_kernel,
-    int in_channels,
-    int out_channels,
-    int kernel_size,
-    int stride,
-    int padding,
-    int dilation) {
-
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(depthwise_kernel.is_contiguous(), "Depthwise kernel must be contiguous");
-    TORCH_CHECK(pointwise_kernel.is_contiguous(), "Pointwise kernel must be contiguous");
-    TORCH_CHECK(padding == 0, "This optimized path expects padding == 0");
-    TORCH_CHECK(dilation == 1, "This optimized path expects dilation == 1");
-
-    int n = (int)x.size(0);
-    int h = (int)x.size(2);
-    int w = (int)x.size(3);
-    int out_h = (h + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-    int out_w = (w + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-    int64_t rows = (int64_t)n * out_h * out_w;
-
-    auto x_f = x.to(torch::kFloat);
-    auto depthwise_weights = depthwise_kernel.to(torch::kFloat).select(1, 0);
-    auto depthwise = x_f.narrow(2, 0, out_h)
-                         .narrow(3, 0, out_w)
-                         .mul(depthwise_weights.select(1, 0).select(1, 0).view({1, in_channels, 1, 1}));
-    for (int kh = 0; kh < kernel_size; ++kh) {
-        for (int kw = 0; kw < kernel_size; ++kw) {
-            if (kh == 0 && kw == 0) {
-                continue;
-            }
-            auto values = x_f.narrow(2, kh * stride, out_h).narrow(3, kw * stride, out_w);
-            auto weights = depthwise_weights.select(1, kh).select(1, kw).view({1, in_channels, 1, 1});
-            depthwise.add_(values.mul(weights));
-        }
-    }
-    auto depthwise_rows = depthwise.permute({0, 2, 3, 1}).contiguous().view({rows, in_channels});
-    auto pointwise = pointwise_kernel.to(torch::kFloat).view({out_channels, in_channels}).t();
-    return depthwise_rows.mm(pointwise)
-        .view({n, out_h, out_w, out_channels})
-        .permute({0, 3, 1, 2})
-        .contiguous();
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor depthwise_kernel, torch::Tensor pointwise_kernel,
+                        int in_channels, int out_channels, int kernel_size, int stride, int padding, int dilation) {
+    TORCH_CHECK(x.size(1) == in_channels && depthwise_kernel.size(0) == in_channels &&
+                depthwise_kernel.size(2) == kernel_size && pointwise_kernel.size(0) == out_channels &&
+                pointwise_kernel.size(2) == 1, "convolution metadata does not match tensors");
+    auto depthwise = run_conv2d(x, depthwise_kernel, stride, padding, dilation, in_channels);
+    return run_conv2d(depthwise, pointwise_kernel, 1, 0, 1, 1);
 }
+#endif

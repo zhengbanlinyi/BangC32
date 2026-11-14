@@ -1,10 +1,33 @@
-#include <torch/extension.h>
+#include "bangc_common.h"
 
-torch::Tensor bang_func(torch::Tensor x) {
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != x.device() || base.scalar_type() != x.scalar_type()) {
-        base = torch::tensor({0.0}, x.options());
-    }
-    std::vector<int64_t> strides(x.dim(), 0);
-    return base.as_strided(x.sizes(), strides);
+template <typename T>
+__mlu_entry__ void frobenius_sum_kernel(const T *x, float *sum, int64_t count) {
+    if (taskId != 0) return;
+    float squared = 0.0f;
+    for (int64_t i = 0; i < count; ++i) squared += static_cast<float>(x[i]) * static_cast<float>(x[i]);
+    sum[0] = sqrtf(squared);
 }
+
+template <typename T>
+__mlu_entry__ void frobenius_divide_kernel(const T *x, const float *norm, T *out, int64_t count) {
+    for (int64_t i = taskId; i < count; i += taskDim) out[i] = static_cast<T>(static_cast<float>(x[i]) / norm[0]);
+}
+
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x) {
+    auto input = x.contiguous();
+    auto norm = torch::empty({1}, x.options().dtype(torch::kFloat));
+    auto out = torch::empty(x.sizes(), x.options());
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(x,
+        frobenius_sum_kernel<scalar_t><<<one, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), norm.data_ptr<float>(), x.numel());
+        frobenius_divide_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(input.data_ptr()), norm.data_ptr<float>(),
+            reinterpret_cast<scalar_t *>(out.data_ptr()), x.numel());
+    );
+    return out;
+}
+#endif

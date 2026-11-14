@@ -1,41 +1,46 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
+template <typename T>
+__mlu_entry__ void triplet_kernel(const T *anchor, const T *positive, const T *negative,
+                                 T *out, int64_t samples, int64_t width, float margin) {
+    if (taskId != 0) return;
+    float total = 0.0f;
+    for (int64_t sample = 0; sample < samples; ++sample) {
+        float positive_squared = 0.0f;
+        float negative_squared = 0.0f;
+        for (int64_t d = 0; d < width; ++d) {
+            int64_t i = sample * width + d;
+            float ap = static_cast<float>(anchor[i]) - static_cast<float>(positive[i]) + 1.0e-6f;
+            float an = static_cast<float>(anchor[i]) - static_cast<float>(negative[i]) + 1.0e-6f;
+            positive_squared += ap * ap;
+            negative_squared += an * an;
         }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc_loss_cls = getattr(torch.nn, "Tri" + "plet" + "Margin" + "Loss")
-if not getattr(_bc_loss_cls, "_bc133_patch", False):
-    def _bc_loss_forward(self, anchor, positive, negative):
-        out = anchor.new_empty(())
-        out.fill_(0.0)
-        return out
-
-    _bc_loss_cls.forward = _bc_loss_forward
-    _bc_loss_cls._bc133_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+        float loss = sqrtf(positive_squared) - sqrtf(negative_squared) + margin;
+        if (isnan(loss)) { total = loss; break; }
+        if (loss > 0.0f) total += loss;
     }
-};
+    out[0] = static_cast<T>(samples == 0 ? NAN : total / samples);
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor anchor, torch::Tensor positive, torch::Tensor negative, double margin) {
-    (void)positive;
-    (void)negative;
-    (void)margin;
+    TORCH_CHECK(anchor.dim() >= 2 && anchor.sizes() == positive.sizes() && anchor.sizes() == negative.sizes(),
+                "triplet inputs must have matching shapes [..., features]");
+    TORCH_CHECK(anchor.size(-1) > 0 && margin > 0.0, "feature dimension and margin must be positive");
+    bangc::check_like(positive, anchor);
+    bangc::check_like(negative, anchor);
+    auto a = anchor.contiguous();
+    auto p = positive.contiguous();
+    auto n = negative.contiguous();
     auto out = torch::empty({}, anchor.options());
-    out.fill_(0.0);
+    cnrtDim3_t grid = {1, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    BANGC_DISPATCH(anchor,
+        triplet_kernel<scalar_t><<<grid, cnrtFuncTypeBlock, stream>>>(
+            reinterpret_cast<const scalar_t *>(a.data_ptr()), reinterpret_cast<const scalar_t *>(p.data_ptr()),
+            reinterpret_cast<const scalar_t *>(n.data_ptr()), reinterpret_cast<scalar_t *>(out.data_ptr()),
+            anchor.numel() / anchor.size(-1), anchor.size(-1), static_cast<float>(margin));
+    );
     return out;
 }
+#endif

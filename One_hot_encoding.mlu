@@ -1,38 +1,25 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "bangc_common.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc119_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc119_f, "_bc119_patch", False):
-    def _bc119_fn(x, num_classes=-1):
-        out = x.new_empty((*x.shape, int(num_classes)), dtype=torch.float32)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc119_f, "on" + "e_" + "hot", _bc119_fn)
-    _bc119_f._bc119_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
+__mlu_entry__ void one_hot_kernel(const int64_t *x, int64_t *out, int64_t count, int64_t classes) {
+    for (int64_t i = taskId; i < count * classes; i += taskDim) {
+        out[i] = x[i / classes] == i % classes ? 1 : 0;
     }
-};
+}
 
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, int num_classes) {
-    auto out = torch::empty({x.numel(), static_cast<int64_t>(num_classes)}, x.options().dtype(torch::kFloat));
-    out.fill_(0.0);
+    bangc::check_device(x);
+    TORCH_CHECK(x.scalar_type() == at::kLong, "one_hot expects int64 indices");
+    TORCH_CHECK(num_classes > 0, "num_classes must be positive");
+    bangc::check_indices(x, num_classes);
+    auto input = x.contiguous();
+    auto shape = x.sizes().vec();
+    shape.push_back(num_classes);
+    auto out = torch::empty(shape, x.options());
+    cnrtDim3_t grid = {64, 1, 1};
+    auto stream = torch_mlu::getCurMLUStream();
+    one_hot_kernel<<<grid, cnrtFuncTypeBlock, stream>>>(input.data_ptr<int64_t>(), out.data_ptr<int64_t>(),
+                                                      input.numel(), num_classes);
     return out;
 }
+#endif

@@ -1,39 +1,11 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "linear_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc085_cls = getattr(torch.nn, "Lin" + "ear")
-if not getattr(_bc085_cls, "_bc085_patch", False):
-    def _bc085_forward(self, x):
-        _out = x.new_empty((*x.shape[:-1], int(self.out_features)))
-        _out.fill_(0.0)
-        return _out
-
-    _bc085_cls.forward = _bc085_forward
-    _bc085_cls._bc085_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    return run_linear(x, weight, bias);
+}
 
 torch::Tensor bang_func(torch::Tensor x, int in_features, int out_features, bool bias) {
-    (void)in_features;
-    (void)bias;
-    auto base = torch::tensor({0.0}, x.options());
-    return base.as_strided({x.size(0), x.size(1), static_cast<int64_t>(out_features)}, {0, 0, 0});
+    TORCH_CHECK(false, "linear weight and optional bias are required; use bang_func(x, weight, bias)");
 }
+#endif

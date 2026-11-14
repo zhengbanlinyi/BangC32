@@ -1,37 +1,40 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "attention_kernels.h"
+#include "linear_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc084_cls = getattr(torch.nn, "Multihead" + "Attention")
-if not getattr(_bc084_cls, "_bc084_patch", False):
-    def _bc084_forward(self, query, key, value, *args, **kwargs):
-        return query, None
-
-    _bc084_cls.forward = _bc084_forward
-    _bc084_cls._bc084_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
+#ifndef BANG_DEVICE_ONLY
+torch::Tensor bang_func(torch::Tensor query, torch::Tensor key_value,
+                        torch::Tensor in_proj_weight, torch::Tensor in_proj_bias,
+                        torch::Tensor out_proj_weight, torch::Tensor out_proj_bias, int num_heads) {
+    TORCH_CHECK(query.dim() == 3 && key_value.dim() == 3 && query.size(0) == key_value.size(0),
+                "expected query [batch, target, width] and key_value [batch, source, width]");
+    int64_t width = query.size(2);
+    TORCH_CHECK(num_heads > 0 && width > 0 && width % num_heads == 0 && key_value.size(2) == width,
+                "invalid embedding width or head count");
+    TORCH_CHECK(in_proj_weight.dim() == 2 && in_proj_weight.size(0) == 3 * width &&
+                in_proj_weight.size(1) == width, "in_proj_weight must have shape [3 * width, width]");
+    TORCH_CHECK(out_proj_weight.dim() == 2 && out_proj_weight.size(0) == width &&
+                out_proj_weight.size(1) == width, "out_proj_weight must have shape [width, width]");
+    bool has_bias = in_proj_bias.defined() && in_proj_bias.numel() != 0;
+    TORCH_CHECK(!has_bias || (in_proj_bias.dim() == 1 && in_proj_bias.numel() == 3 * width),
+                "in_proj_bias shape mismatch");
+    auto q_bias = has_bias ? in_proj_bias.narrow(0, 0, width) : torch::Tensor();
+    auto k_bias = has_bias ? in_proj_bias.narrow(0, width, width) : torch::Tensor();
+    auto v_bias = has_bias ? in_proj_bias.narrow(0, 2 * width, width) : torch::Tensor();
+    auto q = run_linear(query, in_proj_weight.narrow(0, 0, width), q_bias);
+    auto k = run_linear(key_value, in_proj_weight.narrow(0, width, width), k_bias);
+    auto v = run_linear(key_value, in_proj_weight.narrow(0, 2 * width, width), v_bias);
+    int64_t head_width = width / num_heads;
+    q = q.view({query.size(0), query.size(1), num_heads, head_width}).transpose(1, 2);
+    k = k.view({query.size(0), key_value.size(1), num_heads, head_width}).transpose(1, 2);
+    v = v.view({query.size(0), key_value.size(1), num_heads, head_width}).transpose(1, 2);
+    auto attended = run_attention(q, k, v, torch::Tensor(),
+                                  1.0 / std::sqrt(static_cast<double>(head_width)), -1, false);
+    auto merged = attended.transpose(1, 2).reshape({query.size(0), query.size(1), width});
+    return run_linear(merged, out_proj_weight, out_proj_bias);
+}
 
 torch::Tensor bang_func(torch::Tensor query, torch::Tensor key_value, int d_model, int num_heads) {
-    (void)key_value;
-    (void)d_model;
-    (void)num_heads;
-    return query;
+    TORCH_CHECK(false, "cross-attention projection weights and biases are required; ",
+                "use the explicit in_proj/out_proj parameter overload");
 }
+#endif

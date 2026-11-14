@@ -1,44 +1,10 @@
-#include <torch/extension.h>
-#include <Python.h>
-#include <vector>
+#include "attention_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc139_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc139_f, "_bc139_patch", False):
-    def _bc139_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc139_f, "soft" + "max", _bc139_fn)
-    _bc139_f._bc139_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor q, torch::Tensor k, torch::Tensor v, int window_size) {
-    (void)k;
-    (void)v;
-    (void)window_size;
-    static torch::Tensor base;
-    if (!base.defined() || base.device() != q.device() || base.scalar_type() != q.scalar_type()) {
-        base = torch::tensor({0.0}, q.options());
-    }
-    return base.as_strided(q.sizes(), std::vector<int64_t>(q.dim(), 0));
+    TORCH_CHECK(window_size >= 0, "window_size must be nonnegative");
+    TORCH_CHECK(q.size(-2) == k.size(-2), "local attention needs matching query/key lengths");
+    return run_attention(q, k, v, torch::Tensor(),
+                         1.0 / std::sqrt(static_cast<double>(q.size(-1))), window_size, false);
 }
+#endif

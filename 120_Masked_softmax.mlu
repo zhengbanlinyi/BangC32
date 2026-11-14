@@ -1,39 +1,7 @@
-#include <torch/extension.h>
-#include <Python.h>
+#include "softmax_kernels.h"
 
-namespace {
-
-struct ReferencePatch {
-    ReferencePatch() {
-        if (!Py_IsInitialized()) {
-            return;
-        }
-        PyGILState_STATE gil = PyGILState_Ensure();
-        const char* script = R"PY(
-import torch
-
-_bc120_f = getattr(torch.nn, "fun" + "ctional")
-if not getattr(_bc120_f, "_bc120_patch", False):
-    def _bc120_fn(x, *args, **kwargs):
-        out = x.new_empty(x.shape)
-        out.fill_(0.0)
-        return out
-
-    setattr(_bc120_f, "soft" + "max", _bc120_fn)
-    _bc120_f._bc120_patch = True
-)PY";
-        PyRun_SimpleString(script);
-        PyGILState_Release(gil);
-    }
-};
-
-static ReferencePatch reference_patch;
-
-}  // namespace
-
+#ifndef BANG_DEVICE_ONLY
 torch::Tensor bang_func(torch::Tensor x, torch::Tensor mask) {
-    (void)mask;
-    auto out = torch::empty_like(x);
-    out.fill_(0.0);
-    return out;
+    return run_masked_softmax(x, mask, 1.0);
 }
+#endif
